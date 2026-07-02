@@ -33,6 +33,10 @@
 #include <systemd/sd-json.h>
 #include <systemd/sd-id128.h>
 
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
+
 #include "vault.h"
 
 #define streq(a, b) (strcmp((a), (b)) == 0)
@@ -379,6 +383,7 @@ static CallerGrade grade_from_name(const char *s) {
  * lock state, the item's opt-in release policy + freshness, and the caller's
  * identity grade. Items opt in via attributes:
  *   platformd.policy = fresh-verification   (require unlock within g_fresh_window)
+ *   platformd.policy = trusted-platform     (require platformd-trustd's local-trusted-session verdict)
  *   platformd.min-grade = <grade>           (require at least this caller grade)
  * With no attributes an item is released whenever the collection is unlocked.
  */
@@ -388,9 +393,90 @@ static bool collection_locked(Manager *m) {
         return m->desktop_locked || m->manual_locked;
 }
 
-typedef enum { GATE_ALLOW, GATE_LOCKED, GATE_STALE, GATE_CALLER } GateResult;
+/* The caller's user's graphical (display) session — the platform-trust question
+ * is about the user's desktop presence, not the specific caller process. */
+static int caller_session(sd_bus_message *m, char **ret) {
+        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
+        uid_t uid;
 
-static GateResult trust_gate(Item *item, CallerGrade grade) {
+        *ret = NULL;
+        if (sd_bus_query_sender_creds(m, SD_BUS_CREDS_EUID | SD_BUS_CREDS_AUGMENT, &creds) < 0 ||
+            sd_bus_creds_get_euid(creds, &uid) < 0)
+                return -1;
+        return sd_uid_get_display(uid, ret);
+}
+
+/* Consult platformd-trustd's local-trusted-session verdict over its Varlink
+ * socket — a raw exchange (JSON + NUL), since sd_varlink_call re-enters the event
+ * loop inside a bus handler. Returns 1 satisfied, 0 denied, -1 trustd unavailable. */
+static int trustd_local_trusted(const char *session) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+        sd_json_variant *params, *outer, *res;
+        struct sockaddr_un sa = { .sun_family = AF_UNIX };
+        struct timeval tv = { .tv_sec = 2 };
+        _cleanup_free_ char *buf = NULL;
+        const char *sock;
+        char req[256];
+        size_t buflen = 0, cap = 0;
+        int fd, len;
+
+        if (!session || !*session)
+                return 0;
+        sock = getenv("PLATFORMD_TRUST_SOCKET");
+        if (!sock || !*sock)
+                sock = "/run/platformd-trustd/io.platformd.Trust";
+        strncpy(sa.sun_path, sock, sizeof sa.sun_path - 1);
+        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+                return -1;
+        (void) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        (void) setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        if (connect(fd, (struct sockaddr *) &sa, sizeof sa) < 0) {
+                close(fd);
+                return -1;   /* trustd not running */
+        }
+        len = snprintf(req, sizeof req,
+                "{\"method\":\"io.platformd.Trust.EvaluatePolicy\","
+                "\"parameters\":{\"policy\":\"local-trusted-session\",\"sessionId\":\"%s\"}}",
+                session);
+        if (len < 0 || len >= (int) sizeof req || write(fd, req, (size_t) len + 1) != (ssize_t) len + 1) {
+                close(fd);
+                return -1;
+        }
+        for (;;) {
+                char chunk[1024];
+                ssize_t n = read(fd, chunk, sizeof chunk);
+                char *nb;
+
+                if (n <= 0)
+                        break;
+                if (buflen + (size_t) n + 1 > cap) {
+                        cap = (buflen + (size_t) n + 1) * 2;
+                        if (!(nb = realloc(buf, cap)))
+                                break;
+                        buf = nb;
+                }
+                memcpy(buf + buflen, chunk, (size_t) n);
+                buflen += (size_t) n;
+                if (memchr(chunk, 0, (size_t) n))
+                        break;
+        }
+        close(fd);
+        if (!buf)
+                return -1;
+        buf[buflen] = 0;
+        if (sd_json_parse(buf, 0, &reply, NULL, NULL) < 0 || sd_json_variant_by_key(reply, "error"))
+                return -1;
+        params = sd_json_variant_by_key(reply, "parameters");
+        outer = params ? sd_json_variant_by_key(params, "result") : NULL;
+        res = outer ? sd_json_variant_by_key(outer, "result") : NULL;
+        return res && sd_json_variant_is_string(res) &&
+               streq(sd_json_variant_string(res), "policy-satisfied") ? 1 : 0;
+}
+
+typedef enum { GATE_ALLOW, GATE_LOCKED, GATE_STALE, GATE_CALLER, GATE_TRUSTD } GateResult;
+
+static GateResult trust_gate(Item *item, CallerGrade grade, sd_bus_message *m) {
         Manager *mgr = manager_instance;
         const char *policy, *mingrade;
 
@@ -401,6 +487,12 @@ static GateResult trust_gate(Item *item, CallerGrade grade) {
         if (policy && streq(policy, "fresh-verification") && g_fresh_window > 0 &&
             now_mono() - mgr->last_verify > g_fresh_window)
                 return GATE_STALE;
+        if (policy && streq(policy, "trusted-platform")) {
+                _cleanup_free_ char *session = NULL;
+                (void) caller_session(m, &session);
+                if (trustd_local_trusted(session) != 1)   /* denied or trustd absent */
+                        return GATE_TRUSTD;
+        }
 
         mingrade = attr_get(item->attrs, "platformd.min-grade");
         if (mingrade && grade < grade_from_name(mingrade))
@@ -500,7 +592,7 @@ static int item_get_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         const char *session;
         int r;
         CallerGrade grade = caller_grade(m);
-        GateResult g = trust_gate(item, grade);
+        GateResult g = trust_gate(item, grade, m);
 
         /* A stale fresh-verification item gets one chance to prove presence: a
          * polkit prompt (auth_self) via the desktop agent. On success it is fresh
@@ -520,6 +612,9 @@ static int item_get_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         case GATE_CALLER:
                 return sd_bus_error_set(e, SD_BUS_ERROR_ACCESS_DENIED,
                                         "Caller identity is too weak for this item");
+        case GATE_TRUSTD:
+                return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
+                                        "Platform is not in a trusted state (platformd-trustd)");
         case GATE_ALLOW:
                 break;
         }
@@ -1689,7 +1784,7 @@ static int method_get_secrets(sd_bus_message *m, void *userdata, sd_bus_error *e
                 return r;
         for (size_t k = 0; k < n; k++) {
                 Item *it = manager_find_by_path(mgr, paths[k]);
-                if (!it || trust_gate(it, grade) != GATE_ALLOW)
+                if (!it || trust_gate(it, grade, m) != GATE_ALLOW)
                         continue;
                 if ((r = sd_bus_message_open_container(reply, 'e', "o(oayays)")) < 0)
                         return r;
