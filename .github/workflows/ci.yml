@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitize: ['none', 'address,undefined']
+    name: build & test (sanitize=${{ matrix.sanitize }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build pkg-config \
+            libsystemd-dev libssl-dev \
+            xsltproc docbook-xsl libxml2-utils \
+            dbus libsecret-tools systemd
+
+      - name: Configure
+        run: |
+          extra=""
+          [ "${{ matrix.sanitize }}" != "none" ] && extra="-Db_sanitize=${{ matrix.sanitize }}"
+          meson setup build $extra
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: meson test -C build --print-errorlogs

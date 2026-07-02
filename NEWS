@@ -1,0 +1,54 @@
+platformd-secretd NEWS
+======================
+
+platformd-secretd 0.0.1 (unreleased)
+
+  First working release of the platform-authentication-aware Secret Service
+  provider for org.freedesktop.secrets.
+
+  Features:
+    * Full freedesktop.org Secret Service API over D-Bus: Service, Collections
+      (the default served at both the collection and alias paths, plus
+      CreateCollection / Delete for additional named collections), Items,
+      Sessions and Prompts; libsecret / secret-tool compatible. Change signals
+      (CollectionCreated / CollectionDeleted, ItemCreated / ItemChanged /
+      ItemDeleted) and writable Label / Attributes.
+    * Encrypted session transport: the Diffie-Hellman key-agreement algorithm
+      (dh-ietf1024-sha256-aes128-cbc-pkcs7), byte-compatible with libsecret, so
+      secret values are encrypted in transit and never cross the bus in the
+      clear. Plain transport is still offered for clients that ask for it.
+    * Encryption at rest: AES-256-GCM with an Argon2id-derivable key, the key
+      delivered as a systemd credential ($CREDENTIALS_DIRECTORY/vault-key). With
+      no key configured the store is kept in the clear (for already-encrypted
+      homes, e.g. systemd-homed luks/fscrypt). The daemon detects the homed
+      storage backend and warns when secrets would sit in the clear on an
+      unencrypted home.
+    * The trust gate -- the platform-authentication differentiator:
+        - lock state tracks the desktop session via systemd-logind: locking the
+          screen locks the secrets, unlocking restores them. While the session is
+          locked, Unlock is refused -- the only key is unlocking the session
+          itself, which takes real authentication. An explicit Service.Lock is
+          cleared through a Prompt object that re-authenticates via polkit;
+        - caller identity is graded from D-Bus peer credentials
+          (unknown / same-user-weak / systemd-unit / sandboxed-app);
+        - items may opt into fresh-verification and a minimum caller grade via the
+          "platformd.policy" and "platformd.min-grade" attributes; a stale
+          fresh-verification item triggers an interactive polkit prompt
+          (auth_self, action io.platformd.secret1.verify-fresh) for on-demand
+          re-verification.
+    * secretctl(1): status, list, lock, unlock.
+    * A Varlink admin/introspection interface, io.platformd.Secret (GetStatus,
+      ListItems -- metadata only, never secrets), the way systemd's own services
+      expose one; browse it with varlinkctl. Served on
+      $XDG_RUNTIME_DIR/platformd-secretd/io.platformd.Secret.
+    * Structured audit logging to the journal
+      (journalctl PLATFORMD_EVENT=secret-read).
+    * Memory hygiene: secrets zeroized on free, vault key mlocked,
+      MemorySwapMax=0, LimitCORE=0, and systemd sandboxing on the unit.
+
+  Tests (meson test): vault (crypto primitives), integration (isolated D-Bus
+  store/lookup round-trip), and malformed-store (parser robustness against
+  truncated / bit-flipped / hostile store files). Green under ASan/UBSan.
+
+  Versioning: the 0.x series is pre-release. The 1.0 tag is gated on an
+  independent security review.

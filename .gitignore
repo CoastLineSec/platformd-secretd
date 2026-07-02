@@ -1,0 +1,12 @@
+# meson / ninja build output
+/build/
+/build-*/
+/builddir/
+*.o
+*.a
+
+# secretd must never commit secrets, vaults, or logs
+*.log
+.env
+**/vault/
+**/*.vault
