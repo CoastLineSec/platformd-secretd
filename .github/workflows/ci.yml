@@ -9,22 +9,27 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    # Arch's libsystemd is current (>= 261); the sd-varlink / sd-json APIs the
+    # Varlink interface uses require >= 257, which Ubuntu LTS runners do not ship.
+    container: archlinux:latest
     strategy:
       fail-fast: false
       matrix:
         sanitize: ['none', 'address,undefined']
     name: build & test (sanitize=${{ matrix.sanitize }})
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
+      # The base image ships neither git (needed by actions/checkout) nor the
+      # toolchain, so install everything before checking out.
+      - name: Install toolchain and dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            meson ninja-build pkg-config \
-            libsystemd-dev libssl-dev \
-            xsltproc docbook-xsl libxml2-utils \
-            dbus libsecret-tools systemd
+          pacman -Sy --noconfirm --needed archlinux-keyring
+          pacman -Syu --noconfirm --needed \
+            git base-devel meson ninja \
+            systemd openssl polkit \
+            dbus libsecret \
+            libxslt docbook-xsl
+
+      - uses: actions/checkout@v4
 
       - name: Configure
         run: |
