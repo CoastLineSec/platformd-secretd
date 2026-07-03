@@ -474,6 +474,71 @@ static int trustd_local_trusted(const char *session) {
                streq(sd_json_variant_string(res), "policy-satisfied") ? 1 : 0;
 }
 
+/* Ask platformd-verifyd to prove the caller's user is present now (it drives the
+ * platformd-verify PAM stack — fingerprint, face, …). A raw exchange with a long
+ * receive timeout, since the user must physically respond. Returns 1 verified,
+ * 0 declined or the service is unavailable. */
+static int verifyd_verify_user(const char *session, const char *reason) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+        sd_json_variant *params, *verified;
+        struct sockaddr_un sa = { .sun_family = AF_UNIX };
+        struct timeval tv = { .tv_sec = 120 };
+        _cleanup_free_ char *buf = NULL;
+        const char *sock;
+        char req[512];
+        size_t buflen = 0, cap = 0;
+        int fd, len;
+
+        sock = getenv("PLATFORMD_VERIFY_SOCKET");
+        if (!sock || !*sock)
+                sock = "/run/platformd-verifyd/io.platformd.Verify";
+        strncpy(sa.sun_path, sock, sizeof sa.sun_path - 1);
+        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+                return 0;
+        (void) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        (void) setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        if (connect(fd, (struct sockaddr *) &sa, sizeof sa) < 0) {
+                close(fd);
+                return 0;   /* verification service not running */
+        }
+        len = snprintf(req, sizeof req,
+                "{\"method\":\"io.platformd.Verify.VerifyUser\","
+                "\"parameters\":{\"sessionId\":\"%s\",\"reason\":\"%s\"}}",
+                session ?: "", reason ?: "");
+        if (len < 0 || len >= (int) sizeof req || write(fd, req, (size_t) len + 1) != (ssize_t) len + 1) {
+                close(fd);
+                return 0;
+        }
+        for (;;) {
+                char chunk[1024];
+                ssize_t n = read(fd, chunk, sizeof chunk);
+                char *nb;
+
+                if (n <= 0)
+                        break;
+                if (buflen + (size_t) n + 1 > cap) {
+                        cap = (buflen + (size_t) n + 1) * 2;
+                        if (!(nb = realloc(buf, cap)))
+                                break;
+                        buf = nb;
+                }
+                memcpy(buf + buflen, chunk, (size_t) n);
+                buflen += (size_t) n;
+                if (memchr(chunk, 0, (size_t) n))
+                        break;
+        }
+        close(fd);
+        if (!buf)
+                return 0;
+        buf[buflen] = 0;
+        if (sd_json_parse(buf, 0, &reply, NULL, NULL) < 0 || sd_json_variant_by_key(reply, "error"))
+                return 0;
+        params = sd_json_variant_by_key(reply, "parameters");
+        verified = params ? sd_json_variant_by_key(params, "verified") : NULL;
+        return verified && sd_json_variant_boolean(verified) ? 1 : 0;
+}
+
 typedef enum { GATE_ALLOW, GATE_LOCKED, GATE_STALE, GATE_CALLER, GATE_TRUSTD } GateResult;
 
 static GateResult trust_gate(Item *item, CallerGrade grade, sd_bus_message *m) {
@@ -600,6 +665,18 @@ static int item_get_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         if (g == GATE_STALE && polkit_check_fresh(m)) {
                 manager_instance->last_verify = now_mono();
                 g = GATE_ALLOW;
+        }
+
+        /* A stale trusted-platform item is re-verified through platformd-verifyd:
+         * it proves the user present (fingerprint, face, …) and refreshes the trust
+         * authority, so if platformd-trustd then reports the platform trusted,
+         * release. One call — no polkit action, no borrowed PAM module. */
+        if (g == GATE_TRUSTD) {
+                _cleanup_free_ char *session = NULL;
+                (void) caller_session(m, &session);
+                if (verifyd_verify_user(session, "release a trusted-platform secret") &&
+                    trustd_local_trusted(session) == 1)
+                        g = GATE_ALLOW;
         }
 
         switch (g) {
