@@ -240,7 +240,7 @@ typedef struct TrustVerdict {
         uint64_t    expires_usec;    /* 0 = no expiry */
 } TrustVerdict;
 
-/* Pluggable backend: a local logind-backed stub now, platformd-trustd later. */
+/* Pluggable backend: a local logind session model, and platformd-trustd's verdict for platform-trust policies. */
 typedef struct TrustGate {
         int (*evaluate)(struct TrustGate *gate, const ReleaseRequest *req, TrustVerdict *ret);
         void *userdata;
@@ -265,17 +265,20 @@ prints this.
   authentication method.
 - `fresh-user-verification` — `credential-release-basic` plus a verification event
   within a freshness window and a session not marked stale by suspend/resume.
+- `trusted-platform` — release is gated on `platformd-trustd`'s
+  `local-trusted-session` verdict: a verified-local boot, a verified user identity,
+  and a fresh user verification. This is the boot- and TPM-aware policy the
+  session-only policies above stop short of.
 
-Boot-aware and TPM-bound policies are named placeholders; they require
-`platformd-trustd` boot evidence and a documented TPM policy first.
-
-**The gate backend.** Until `platformd-trustd` exists, the gate is a local stub
-derived from what can be honestly observed: a logind session that is active
-(*observed*) and unlocked (*declared*, from `login1` `LockedHint`), within a
-freshness window. The `TrustGate` indirection lets `platformd-trustd` replace the
-stub later without changing the storage, the D-Bus surface, or the item policies.
-`Lock`/`Unlock` map onto this model: unlocking records a verification event;
-locking marks items unavailable and clears cached plaintext.
+**The gate backend.** Session-based policies are decided locally from what can be
+honestly observed: a logind session that is active (*observed*) and unlocked
+(*declared*, from `login1` `LockedHint`), within a freshness window. The
+`trusted-platform` policy is decided by `platformd-trustd`, which secretd consumes
+over Varlink (`io.platformd.Trust.EvaluatePolicy`, `local-trusted-session`); the
+`TrustGate` indirection keeps that behind one interface, without changing the
+storage, the D-Bus surface, or the item policies. `Lock`/`Unlock` map onto the
+session model: unlocking records a verification event; locking marks items
+unavailable and clears cached plaintext.
 
 **Enforcement (as implemented).** The gate is `trust_gate()`, evaluated in
 `Item.GetSecret`. Effective lock state is the OR of two sources: the logind
@@ -285,13 +288,16 @@ Crucially, **`Service.Unlock` refuses while `desktop_locked`** — a client cann
 release secrets while the screen is locked; the only key is unlocking the
 session itself, which takes real authentication. Items opt into stronger gating
 with attributes: `platformd.policy=fresh-verification` (released only within a
-freshness window of a genuine desktop unlock) and `platformd.min-grade` (a
-caller-grade floor). A stale `fresh-verification` read triggers an interactive
+freshness window of a genuine desktop unlock), `platformd.policy=trusted-platform`
+(gated on `platformd-trustd`'s `local-trusted-session` verdict), and
+`platformd.min-grade` (a caller-grade floor). A stale `fresh-verification` read
+triggers an interactive
 **polkit** check (`io.platformd.secret1.verify-fresh`, `auth_self`): the desktop
 agent prompts the user, and only a real authentication refreshes the freshness
-and releases the item — nothing an unattended client can do will. A full
-boot/TPM-aware `TrustGate` backend (`platformd-trustd`) can supersede this stub
-without changing the D-Bus surface or the item policies.
+and releases the item. A stale `trusted-platform` read instead steps up through
+**`platformd-verifyd`**, which proves the user present (fingerprint, face, …) and
+refreshes `platformd-trustd`; the item releases only if the platform is then
+trusted. Nothing an unattended client can do releases either.
 
 ## Caller identity
 
@@ -352,20 +358,21 @@ systemd shapes its own:
 | companion `<noun>ctl` | `secretctl` |
 | unit `*.service` (user) | `platformd-secretd.service` |
 | D-Bus `org.freedesktop.<noun>1` | `org.freedesktop.secrets` (the standard provider API) |
-| Varlink `io.systemd.<Noun>` | `io.platformd.Secret` (admin/service interface; planned) |
-| polkit actions | `org.freedesktop.secret1.*` (planned) |
+| Varlink `io.systemd.<Noun>` | `io.platformd.Secret` (admin/service interface) |
+| polkit actions | `io.platformd.secret1.*` (the fresh-verification action) |
 | credentials / TPM | `systemd-creds`, `systemd-cryptenroll` |
 | logging | `systemd-journald` |
 
 What it consumes, and from where:
 
 ```
-systemd-logind     session active / lock state            (now, via the stub gate)
-systemd-homed      home activation as a vault-key anchor   (later)
-systemd-creds /    TPM-sealed vault key                    (later)
+systemd-logind     session active / lock state             (now)
+systemd-homed      home activation as a vault-key anchor    (later)
+systemd-creds /    TPM-sealed vault key                     (later)
   cryptenroll
-platformd-trustd   the real trust signal the gate consumes (later; replaces the stub)
-polkit             authorization for privileged actions    (planned; unchanged otherwise)
+platformd-trustd   the trusted-platform verdict             (now)
+platformd-verifyd  presence step-up for a stale verdict     (now)
+polkit             step-up for a lapsed session             (now)
 ```
 
 `platformd-secretd` does not replace PAM, `systemd-logind`, `systemd-homed`,

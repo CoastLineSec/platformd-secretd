@@ -7,6 +7,11 @@ state. It is the first component of platformd (see `centricd-os`), written in C
 against libsystemd (sd-bus, sd-event, sd-login, sd-journal, sd-varlink) and built
 with meson.
 
+An item may require that the platform be in a trusted state: its release is then
+gated on the `local-trusted-session` verdict from platformd-trustd, and if that
+verdict has lapsed the caller is asked to prove presence through platformd-verifyd
+— a fingerprint, say — before the secret is released.
+
 It provides two programs:
 
 | Program | Role |
@@ -20,6 +25,7 @@ It provides two programs:
 - OpenSSL (libcrypto) ≥ 3.0 — encryption at rest and the DH session transport
 - meson ≥ 1.1, ninja, and a C11 compiler
 - polkit (optional, build time) — installs the fresh-verification action
+- platformd-trustd, platformd-verifyd (optional, runtime) — needed only for items that gate on a trusted platform
 
 ## Build
 
@@ -41,7 +47,9 @@ Functional and feature-complete for a first release: the full Secret Service API
 (collections, items, sessions, prompts) for any libsecret client, encryption at
 rest (AES-256-GCM under a systemd-credential key) and in transit (the DH session
 transport), a persistent store, and the trust gate — secret release tracks the
-logind session lock, grades caller identity, and can require a polkit step-up.
+logind session lock, grades caller identity, and can demand a fresh verification:
+a polkit step-up for a lapsed session, or, for an item that requires a trusted
+platform, platformd-trustd's verdict re-proven through platformd-verifyd.
 `secretctl` and a Varlink admin interface round it out.
 
 ## License
