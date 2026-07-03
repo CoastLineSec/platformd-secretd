@@ -30,12 +30,16 @@ It provides two programs:
 ## Build
 
 ```sh
-meson setup build
+meson setup build --prefix=/usr
 ninja -C build
+sudo meson install -C build
 systemctl --user enable --now platformd-secretd.service
 ```
 
-Binaries are produced under `build/src/secret/`.
+`--prefix=/usr` installs as a system component would expect: `secretctl` in
+`/usr/bin`, the user service under `/usr/lib/systemd/user`, and the D-Bus service
+and polkit action where the session bus and polkit look for them. Binaries are
+produced under `build/src/secret/`.
 
 ## Documentation
 
