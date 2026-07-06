@@ -202,7 +202,7 @@ at rest is the home's job and a second layer adds nothing.
 
 Planned refinements: a passphrase mode (Argon2id, via `vault_derive_key`) for
 interactive unlock; per-item keys, so individual items can be gated
-independently, which pairs with the item-level trust policy (M4) and does not
+independently, which pairs with the item-level trust policy and does not
 change the container format; and auto-selecting the mode from the user's
 `systemd-homed` storage backend.
 
@@ -299,6 +299,24 @@ and releases the item. A stale `trusted-platform` read instead steps up through
 refreshes `platformd-trustd`; the item releases only if the platform is then
 trusted. Nothing an unattended client can do releases either.
 
+**Protected mutation.** The gate guards mutation as well as release. `SetSecret`,
+`SetAttributes`, `Delete`, and a replace-on-`CreateItem` of an item that carries a
+`platformd.*` attribute all require that item's policy to hold — otherwise a caller
+could strip the policy with `SetAttributes` and then read freely, or destroy a
+gated secret while its policy is unsatisfied. A collection `Delete` is refused if
+it would take a gated item down with it. Mutations do not themselves step up (the
+release path offers that); they require the policy to be satisfied *now*.
+
+**The step-up is asynchronous.** A stale read does not block: `GetSecret` defers
+its D-Bus reply and drives the polkit prompt or `platformd-verifyd` call on the
+event loop, so the daemon keeps serving every other client while the user responds
+at the reader. The requesting client is still bound by its own D-Bus method
+timeout; the Secret Service `Prompt` object, which has no client-side timeout, is
+the natural home for a fully interactive unlock. `GetSecrets` (the bulk read)
+never steps up — it silently returns only the items that are releasable right now,
+as the specification's batch semantics intend; a caller that needs a step-up uses
+per-item `GetSecret`.
+
 ## Caller identity
 
 Authenticating the user is not enough; the provider must also identify the
@@ -323,9 +341,9 @@ only what the item policy permits at that grade.
 
 ## Security considerations
 
-This is a sketch, stated honestly, and is refined as the implementation lands.
+Stated honestly, by what the implementation addresses and what it does not.
 
-**Addressed (once M3/M4 land).**
+**Addressed.**
 
 - A same-user process reading high-value secrets without a recent verification —
   bounded by the `fresh-verification` item policy and the trust gate.
@@ -379,18 +397,17 @@ polkit             step-up for a lapsed session             (now)
 polkit, or the kernel keyring, and it does not own the TPM; it consumes TPM
 sealing through systemd.
 
-## Implementation status
+## Status
 
-| Milestone | Scope | State |
-| --- | --- | --- |
-| M1 | `secretctl status` read-only inspector | implemented |
-| M2 | working in-memory provider — claims the bus, default collection, item create/get/set/search/delete; `secret-tool` round-trips | implemented |
-| M3 | encryption at rest (the [storage model](#storage-model)) | implemented |
-| M4 | trust gate, `Lock`/`Unlock` transitions, `Prompt`, polkit | implemented |
-| M5 | TPM-bound and homed-bound vault key; `platformd-trustd` integration | homed detection + credential-delivered key done; `platformd-trustd` future |
-| M6 | spec completeness: DH encrypted transport, multiple collections, Varlink admin | implemented |
+Functional and feature-complete for the freedesktop.org Secret Service API: the
+Service, collections (the default plus additional named ones), items, sessions,
+and prompts, interoperable with libsecret and `secret-tool`. Secrets are encrypted
+in transit (the DH session transport) and at rest (AES-256-GCM). The trust gate is
+enforced — the logind session lock, graded caller identity, and the
+`fresh-verification` and `trusted-platform` item policies; the latter consumes
+`platformd-trustd`'s verdict and steps up through `platformd-verifyd`. `secretctl`
+and the `io.platformd.Secret` Varlink interface round it out.
 
-The provider was in-memory and plaintext through M2; from M3 on it encrypts at
-rest and enforces the trust gate. `platformd-trustd` — a separate
-platform-authentication component the trust gate is designed to consume — remains
-the main future work.
+A TPM-bound vault key (via `systemd-cryptenroll`) remains future work; today the
+vault key is delivered as a systemd credential, or the store rides on an
+already-encrypted home.

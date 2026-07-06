@@ -40,3 +40,34 @@ else
         echo "FAIL: lookup returned '$got'"
         exit 1
 fi
+
+# --- A1: protected mutation is gated ----------------------------------------
+# Store an item that requires the trusted-platform verdict. With no
+# platformd-trustd reachable here, that verdict is not satisfied, so the item's
+# secret must not be released — and, the point of this check, its protected state
+# must not be mutable either (SetAttributes could otherwise strip the policy and
+# unlock a read). Point both the trust and verify sockets at dead paths so the
+# verdict is denied and the step-up fails fast without a real reader prompt.
+export PLATFORMD_TRUST_SOCKET="$XDG_DATA_HOME/no-trustd.sock"
+export PLATFORMD_VERIFY_SOCKET="$XDG_DATA_HOME/no-verifyd.sock"
+printf 'p1atf0rm' | secret-tool store --label='gated' svc gated platformd.policy trusted-platform
+
+# The gated secret is withheld (verdict denied, no trustd).
+if [ -n "$(secret-tool lookup svc gated 2>/dev/null || true)" ]; then
+        echo "FAIL: gated secret was released without a trusted platform"
+        exit 1
+fi
+echo "PASS: gated secret withheld"
+
+# Find the item's object path and attempt to strip its policy via SetAttributes.
+item="$(busctl --user call org.freedesktop.secrets /org/freedesktop/secrets \
+        org.freedesktop.Secret.Service SearchItems 'a{ss}' 1 svc gated 2>/dev/null \
+        | sed -n 's/.*\(\/org\/freedesktop\/secrets\/[A-Za-z0-9/]*\).*/\1/p' | head -n1)"
+if [ -n "$item" ]; then
+        if busctl --user set-property org.freedesktop.secrets "$item" \
+                org.freedesktop.Secret.Item Attributes 'a{ss}' 1 svc gated >/dev/null 2>&1; then
+                echo "FAIL: stripped the policy off a gated item (mutation not gated)"
+                exit 1
+        fi
+        echo "PASS: protected mutation refused"
+fi

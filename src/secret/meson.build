@@ -1,6 +1,5 @@
 # platformd-secretd — platform-auth-aware Secret Service provider.
-# (Sources live here, in src/secret/, exactly as systemd keeps src/home/, etc.
-#  The daemon binary `platformd-secretd` lands at M2; M1 is the secretctl CLI.)
+# (Sources live here, in src/secret/, as systemd keeps src/home/, src/login/, etc.)
 
 executable(
         'secretctl',

@@ -50,11 +50,12 @@ produced under `build/src/secret/`.
 Functional and feature-complete for a first release: the full Secret Service API
 (collections, items, sessions, prompts) for any libsecret client, encryption at
 rest (AES-256-GCM under a systemd-credential key) and in transit (the DH session
-transport), a persistent store, and the trust gate — secret release tracks the
-logind session lock, grades caller identity, and can demand a fresh verification:
-a polkit step-up for a lapsed session, or, for an item that requires a trusted
-platform, platformd-trustd's verdict re-proven through platformd-verifyd.
-`secretctl` and a Varlink admin interface round it out.
+transport), a persistent store, and the trust gate — secret release (and mutation
+of a protected item) tracks the logind session lock, grades caller identity, and
+can demand a fresh verification: a polkit step-up for a lapsed session, or, for an
+item that requires a trusted platform, platformd-trustd's verdict re-proven through
+platformd-verifyd. The step-up is asynchronous, so a slow reader never blocks the
+daemon. `secretctl` and a Varlink admin interface round it out.
 
 ## License
 

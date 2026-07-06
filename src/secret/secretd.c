@@ -2,11 +2,13 @@
 /*
  * platformd-secretd — platform-auth-aware Secret Service provider.
  *
- * Milestone M2: claim org.freedesktop.secrets on the session bus and serve a
- * working Secret Service over sd-bus / sd-event — a default collection, items,
- * CreateItem / GetSecret / SearchItems / GetSecrets — so `secret-tool` round
- * trips. Storage is in-memory and plaintext; encryption at rest is M3, and
- * trust-gating (lock/unlock, fresh verification) is M4. See docs/secret-service.md.
+ * Implements the freedesktop.org Secret Service API (org.freedesktop.secrets) over
+ * sd-bus / sd-event — a default collection, additional named collections, items,
+ * sessions, and prompts — so libsecret and secret-tool interoperate. Secret release
+ * is gated on platform-authentication state: the logind session lock, a graded
+ * caller identity, and per-item freshness / trusted-platform policies. Secrets are
+ * encrypted in transit (the DH session transport) and at rest (AES-256-GCM). See
+ * docs/secret-service.md.
  */
 
 #include <errno.h>
@@ -73,7 +75,7 @@ typedef struct Session {
         struct Session *next;
         char *path;
         sd_bus_slot *slot;      /* the Session object's vtable, unref'd on Close */
-        bool encrypted;         /* DH transport (vs plain) — reserved for DH */
+        bool encrypted;         /* the session uses the DH transport (else plain) */
         uint8_t aes_key[16];    /* AES-128 transport key when encrypted */
 } Session;
 
@@ -102,6 +104,7 @@ typedef struct Manager {
         bool manual_locked;     /* explicit Service.Lock */
         uint64_t last_verify;   /* CLOCK_MONOTONIC secs of the last unlock/verify */
         sd_bus *system_bus;     /* logind lock tracking */
+        char *my_session;       /* login1 object path of our display session, or NULL */
         sd_varlink_server *varlink;   /* io.platformd.Secret admin interface */
         char *home_storage;           /* systemd-homed storage type, cached at startup */
         Session *sessions;
@@ -121,6 +124,10 @@ static const sd_bus_vtable collection_vtable[];
 /* The vault key (loaded from a systemd credential); g_encrypting gates sealing. */
 static uint8_t g_vault_key[VAULT_KEY_LEN];
 static bool g_encrypting;
+/* Set when an existing encrypted store could not be opened (no key, wrong key, or
+ * tampering). We keep serving from memory but must never save — a blind save
+ * would overwrite the unreadable ciphertext with an empty store and destroy it. */
+static bool g_store_readonly;
 static uint64_t g_fresh_window = 300;   /* seconds; fresh-verification window (0 = off) */
 
 static int fail(const char *what, int r) {
@@ -333,7 +340,7 @@ static const char *caller_grade_name(CallerGrade g) {
         }
 }
 
-static CallerGrade caller_grade(sd_bus_message *m) {
+static CallerGrade caller_grade(sd_bus_message *m, const char *event) {
         _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
         CallerGrade grade = CALLER_UNKNOWN;
         uid_t uid = (uid_t) -1;
@@ -358,10 +365,10 @@ static CallerGrade caller_grade(sd_bus_message *m) {
         else if (uid != (uid_t) -1)
                 grade = CALLER_SAME_USER_WEAK;  /* ordinary same-uid process */
 
-        sd_journal_send("MESSAGE=secret read: uid=%d pid=%d unit=%s grade=%s",
-                        (int) uid, (int) pid, unit ? unit : "-", caller_grade_name(grade),
+        sd_journal_send("MESSAGE=caller graded (%s): uid=%d pid=%d unit=%s grade=%s",
+                        event, (int) uid, (int) pid, unit ? unit : "-", caller_grade_name(grade),
                         "PRIORITY=%i", LOG_INFO,
-                        "PLATFORMD_EVENT=secret-read",
+                        "PLATFORMD_EVENT=%s", event,
                         "PLATFORMD_CALLER_UID=%d", (int) uid,
                         "PLATFORMD_CALLER_PID=%d", (int) pid,
                         "PLATFORMD_CALLER_UNIT=%s", unit ? unit : "",
@@ -474,70 +481,9 @@ static int trustd_local_trusted(const char *session) {
                streq(sd_json_variant_string(res), "policy-satisfied") ? 1 : 0;
 }
 
-/* Ask platformd-verifyd to prove the caller's user is present now (it drives the
- * platformd-verify PAM stack — fingerprint, face, …). A raw exchange with a long
- * receive timeout, since the user must physically respond. Returns 1 verified,
- * 0 declined or the service is unavailable. */
-static int verifyd_verify_user(const char *session, const char *reason) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
-        sd_json_variant *params, *verified;
-        struct sockaddr_un sa = { .sun_family = AF_UNIX };
-        struct timeval tv = { .tv_sec = 120 };
-        _cleanup_free_ char *buf = NULL;
-        const char *sock;
-        char req[512];
-        size_t buflen = 0, cap = 0;
-        int fd, len;
-
-        sock = getenv("PLATFORMD_VERIFY_SOCKET");
-        if (!sock || !*sock)
-                sock = "/run/platformd-verifyd/io.platformd.Verify";
-        strncpy(sa.sun_path, sock, sizeof sa.sun_path - 1);
-        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (fd < 0)
-                return 0;
-        (void) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-        (void) setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-        if (connect(fd, (struct sockaddr *) &sa, sizeof sa) < 0) {
-                close(fd);
-                return 0;   /* verification service not running */
-        }
-        len = snprintf(req, sizeof req,
-                "{\"method\":\"io.platformd.Verify.VerifyUser\","
-                "\"parameters\":{\"sessionId\":\"%s\",\"reason\":\"%s\"}}",
-                session ?: "", reason ?: "");
-        if (len < 0 || len >= (int) sizeof req || write(fd, req, (size_t) len + 1) != (ssize_t) len + 1) {
-                close(fd);
-                return 0;
-        }
-        for (;;) {
-                char chunk[1024];
-                ssize_t n = read(fd, chunk, sizeof chunk);
-                char *nb;
-
-                if (n <= 0)
-                        break;
-                if (buflen + (size_t) n + 1 > cap) {
-                        cap = (buflen + (size_t) n + 1) * 2;
-                        if (!(nb = realloc(buf, cap)))
-                                break;
-                        buf = nb;
-                }
-                memcpy(buf + buflen, chunk, (size_t) n);
-                buflen += (size_t) n;
-                if (memchr(chunk, 0, (size_t) n))
-                        break;
-        }
-        close(fd);
-        if (!buf)
-                return 0;
-        buf[buflen] = 0;
-        if (sd_json_parse(buf, 0, &reply, NULL, NULL) < 0 || sd_json_variant_by_key(reply, "error"))
-                return 0;
-        params = sd_json_variant_by_key(reply, "parameters");
-        verified = params ? sd_json_variant_by_key(params, "verified") : NULL;
-        return verified && sd_json_variant_boolean(verified) ? 1 : 0;
-}
+/* The trusted-platform step-up (a call to platformd-verifyd) is asynchronous —
+ * see the step-up machinery below trust_gate, so a slow reader never blocks the
+ * event loop. */
 
 typedef enum { GATE_ALLOW, GATE_LOCKED, GATE_STALE, GATE_CALLER, GATE_TRUSTD } GateResult;
 
@@ -566,10 +512,33 @@ static GateResult trust_gate(Item *item, CallerGrade grade, sd_bus_message *m) {
         return GATE_ALLOW;
 }
 
-/* Interactive step-up: ask polkit (auth_self, via the desktop's agent) to
- * re-verify the user's presence for a stale fresh-verification item. Synchronous
- * — the event loop pauses during the prompt; making this async is a later
- * hardening. Returns true only if the user actually authenticated. */
+/* An item carrying any platformd.* attribute is protected state. */
+static bool item_protected(Item *item) {
+        for (Attr *a = item->attrs; a; a = a->next)
+                if (strncmp(a->key, "platformd.", 10) == 0)
+                        return true;
+        return false;
+}
+
+/* The gate guards protected mutation as well as release: without this, a caller
+ * could strip an item's release policy with SetAttributes and then read it
+ * freely, or overwrite or destroy a gated secret while the policy is not
+ * satisfied. Mutating a protected item requires its policy to hold right now;
+ * mutations do not step up — the release path offers that. Returns 0 to allow,
+ * or a negative error already set on e. */
+static int gate_mutation(Item *item, sd_bus_message *m, sd_bus_error *e) {
+        if (!item_protected(item))
+                return 0;
+        if (trust_gate(item, caller_grade(m, "secret-mutate"), m) != GATE_ALLOW)
+                return sd_bus_error_set(e, SD_BUS_ERROR_ACCESS_DENIED,
+                                        "The item is protected and its release policy is not currently satisfied");
+        return 0;
+}
+
+/* Ask polkit (auth_self, via the desktop agent) to re-authenticate the user.
+ * Synchronous — the event loop pauses during the prompt — so it is used only on
+ * the Prompt path that clears an explicit Service.Lock. Returns true only if the
+ * user actually authenticated. */
 /* /proc/<pid>/stat field 22 — the process start time in clock ticks, as
  * polkit's unix-process subject expects it. */
 static uint64_t proc_starttime(pid_t pid) {
@@ -651,61 +620,251 @@ static bool polkit_check_fresh(sd_bus_message *m) {
         return authorized;
 }
 
-static int item_get_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
-        Item *item = userdata;
+/* --- asynchronous step-up ---------------------------------------------------
+ *
+ * When a secret's release policy is not currently satisfied, item_get_secret does
+ * not answer inline — it defers the D-Bus reply and drives the step-up on the
+ * event loop, so the daemon keeps serving every other client while the user proves
+ * presence (which can take many seconds at the reader). A fresh-verification item
+ * is re-verified by an async polkit prompt; a trusted-platform item by an async
+ * platformd-verifyd call. On completion the gate is re-evaluated and the secret is
+ * released, or a precise error returned.
+ *
+ * Note: the requesting client is still bound by its own D-Bus method timeout, so a
+ * very slow response may time out that one caller — but the daemon stays live and
+ * the verification still refreshes trust for a retry. The Secret Service Prompt
+ * object, which has no client-side timeout, is the natural home for a fully
+ * interactive unlock.
+ */
+
+typedef struct StepUp {
+        sd_bus_message *call;       /* the deferred GetSecret, reffed */
+        char *item_path;            /* re-looked up at completion (the item may vanish) */
+        char *xport_session;        /* Secret Service session for transport encryption */
+        CallerGrade grade;
+        GateResult origin;          /* the gate that triggered the step-up */
+        bool refresh_local;         /* on success, refresh the local freshness clock */
+        sd_varlink *vl;             /* async platformd-verifyd client (trusted-platform) */
+        sd_bus_slot *pk_slot;       /* async polkit call (fresh-verification) */
+} StepUp;
+
+static void stepup_free(StepUp *su) {
+        if (!su)
+                return;
+        sd_varlink_unref(su->vl);       /* the event loop's ref keeps it alive until dispatch returns */
+        sd_bus_slot_unref(su->pk_slot);
+        sd_bus_message_unref(su->call);
+        free(su->item_path);
+        free(su->xport_session);
+        free(su);
+}
+
+/* Send the GetSecret reply for an item, or a clean error if it is gone. */
+static int send_item_secret(sd_bus_message *call, const char *item_path, const char *xport_session) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        const char *session;
+        Item *item = manager_find_by_path(manager_instance, item_path);
         int r;
-        CallerGrade grade = caller_grade(m);
-        GateResult g = trust_gate(item, grade, m);
 
-        /* A stale fresh-verification item gets one chance to prove presence: a
-         * polkit prompt (auth_self) via the desktop agent. On success it is fresh
-         * again and released; nothing else can refresh it. */
-        if (g == GATE_STALE && polkit_check_fresh(m)) {
-                manager_instance->last_verify = now_mono();
-                g = GATE_ALLOW;
-        }
+        if (!item)
+                return sd_bus_reply_method_errorf(call, "org.freedesktop.Secret.Error.NoSuchObject",
+                                                  "The item no longer exists");
+        if ((r = sd_bus_message_new_method_return(call, &reply)) < 0 ||
+            (r = append_secret(reply, xport_session, item->secret, item->secret_len, item->content_type)) < 0)
+                return sd_bus_reply_method_errorf(call, SD_BUS_ERROR_FAILED, "%s", strerror(-r));
+        return sd_bus_send(NULL, reply, NULL);
+}
 
-        /* A stale trusted-platform item is re-verified through platformd-verifyd:
-         * it proves the user present (fingerprint, face, …) and refreshes the trust
-         * authority, so if platformd-trustd then reports the platform trusted,
-         * release. One call — no polkit action, no borrowed PAM module. */
-        if (g == GATE_TRUSTD) {
-                _cleanup_free_ char *session = NULL;
-                (void) caller_session(m, &session);
-                if (verifyd_verify_user(session, "release a trusted-platform secret") &&
-                    trustd_local_trusted(session) == 1)
-                        g = GATE_ALLOW;
-        }
-
+/* Map a denied gate to a Secret Service error reply. */
+static int reply_gate_error(sd_bus_message *call, GateResult g) {
         switch (g) {
-        case GATE_LOCKED:
-                return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
-                                        "The collection is locked");
         case GATE_STALE:
+                return sd_bus_reply_method_errorf(call, "org.freedesktop.Secret.Error.IsLocked",
+                                                  "Fresh verification required (declined)");
+        case GATE_CALLER:
+                return sd_bus_reply_method_errorf(call, SD_BUS_ERROR_ACCESS_DENIED,
+                                                  "Caller identity is too weak for this item");
+        case GATE_TRUSTD:
+                return sd_bus_reply_method_errorf(call, "org.freedesktop.Secret.Error.IsLocked",
+                                                  "Platform is not in a trusted state (platformd-trustd)");
+        default:   /* GATE_LOCKED, or anything unexpected */
+                return sd_bus_reply_method_errorf(call, "org.freedesktop.Secret.Error.IsLocked",
+                                                  "The collection is locked");
+        }
+}
+
+/* The step-up finished — proved is true when the user authenticated. Re-evaluate
+ * the gate (the freshness clock or trustd's verdict has moved) and release the
+ * secret, or return the precise denial. Frees su. */
+static void stepup_complete(StepUp *su, bool proved) {
+        Manager *mgr = manager_instance;
+        Item *item;
+        GateResult g;
+
+        if (!proved) {
+                (void) reply_gate_error(su->call, su->origin);
+                stepup_free(su);
+                return;
+        }
+        if (su->refresh_local)
+                mgr->last_verify = now_mono();
+        item = manager_find_by_path(mgr, su->item_path);
+        if (!item)
+                (void) sd_bus_reply_method_errorf(su->call, "org.freedesktop.Secret.Error.NoSuchObject",
+                                                  "The item no longer exists");
+        else if ((g = trust_gate(item, su->grade, su->call)) == GATE_ALLOW)
+                (void) send_item_secret(su->call, su->item_path, su->xport_session);
+        else
+                (void) reply_gate_error(su->call, g);
+        stepup_free(su);
+}
+
+static int on_verifyd_reply(sd_varlink *link, sd_json_variant *parameters,
+                            const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        StepUp *su = userdata;
+        sd_json_variant *v = parameters ? sd_json_variant_by_key(parameters, "verified") : NULL;
+        bool verified = !error_id && v && sd_json_variant_boolean(v);
+
+        sd_journal_send("MESSAGE=trusted-platform step-up %s", verified ? "verified" : "declined",
+                        "PRIORITY=%i", LOG_NOTICE, "PLATFORMD_EVENT=trusted-platform-stepup",
+                        "PLATFORMD_RESULT=%s", verified ? "verified" : "declined", NULL);
+        stepup_complete(su, verified);
+        return 0;
+}
+
+static int on_polkit_reply(sd_bus_message *reply, void *userdata, sd_bus_error *ret_error) {
+        StepUp *su = userdata;
+        int authorized = 0, challenge = 0;
+
+        if (sd_bus_message_is_method_error(reply, NULL) ||
+            sd_bus_message_enter_container(reply, 'r', "bba{ss}") < 0 ||
+            sd_bus_message_read(reply, "bb", &authorized, &challenge) < 0)
+                authorized = 0;
+        sd_journal_send("MESSAGE=fresh-verification %s", authorized ? "granted" : "declined",
+                        "PRIORITY=%i", LOG_NOTICE, "PLATFORMD_EVENT=fresh-verification",
+                        "PLATFORMD_RESULT=%s", authorized ? "granted" : "declined", NULL);
+        stepup_complete(su, authorized);
+        return 0;
+}
+
+/* Allocate a StepUp bound to the deferred call and item. */
+static StepUp *stepup_new(sd_bus_message *m, const char *xport_session, Item *item,
+                          CallerGrade grade, GateResult origin) {
+        StepUp *su = calloc(1, sizeof *su);
+        if (!su)
+                return NULL;
+        su->origin = origin;
+        su->grade = grade;
+        su->call = sd_bus_message_ref(m);
+        su->item_path = strdup(item->path);
+        su->xport_session = strdup(xport_session ?: "");
+        if (!su->item_path || !su->xport_session) {
+                stepup_free(su);
+                return NULL;
+        }
+        return su;
+}
+
+/* Begin the trusted-platform step-up: an async platformd-verifyd verification. */
+static int stepup_verifyd_begin(sd_bus_message *m, const char *xport_session,
+                                Item *item, CallerGrade grade, sd_bus_error *e) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *params = NULL;
+        _cleanup_free_ char *tsession = NULL;
+        const char *sock = getenv("PLATFORMD_VERIFY_SOCKET");
+        StepUp *su;
+
+        if (!(su = stepup_new(m, xport_session, item, grade, GATE_TRUSTD)))
+                return -ENOMEM;
+        (void) caller_session(m, &tsession);
+
+        if (sd_varlink_connect_address(&su->vl, sock && *sock ? sock :
+                                       "/run/platformd-verifyd/io.platformd.Verify") < 0) {
+                stepup_free(su);
+                return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
+                                        "Platform is not in a trusted state (platformd-trustd)");
+        }
+        (void) sd_varlink_set_userdata(su->vl, su);
+        if (sd_varlink_attach_event(su->vl, sd_bus_get_event(manager_instance->bus), SD_EVENT_PRIORITY_NORMAL) < 0 ||
+            sd_varlink_bind_reply(su->vl, on_verifyd_reply) < 0 ||
+            sd_json_buildo(&params,
+                    SD_JSON_BUILD_PAIR("sessionId", SD_JSON_BUILD_STRING(tsession ?: "")),
+                    SD_JSON_BUILD_PAIR("reason", SD_JSON_BUILD_STRING("release a trusted-platform secret"))) < 0 ||
+            sd_varlink_invoke(su->vl, "io.platformd.Verify.VerifyUser", params) < 0) {
+                stepup_free(su);
+                return sd_bus_error_set(e, SD_BUS_ERROR_FAILED, "cannot start the verification");
+        }
+        return 1;   /* deferred: the reply comes from on_verifyd_reply */
+}
+
+/* Begin the fresh-verification step-up: an async polkit prompt on the system bus
+ * (already attached to the event loop, so the call does not block it). */
+static int stepup_polkit_begin(sd_bus_message *m, const char *xport_session,
+                               Item *item, CallerGrade grade, sd_bus_error *e) {
+        Manager *mgr = manager_instance;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *req = NULL;
+        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
+        StepUp *su;
+        pid_t pid = 0;
+
+        if (!mgr->system_bus ||
+            sd_bus_query_sender_creds(m, SD_BUS_CREDS_PID, &creds) < 0 ||
+            sd_bus_creds_get_pid(creds, &pid) < 0)
                 return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
                                         "Fresh verification required (declined)");
+
+        /* subject (sa{sv}) = "unix-process", { pid, start-time }; then action, empty
+         * details, flags (1 = AllowUserInteraction), cancel id. */
+        if (sd_bus_message_new_method_call(mgr->system_bus, &req,
+                        "org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority",
+                        "org.freedesktop.PolicyKit1.Authority", "CheckAuthorization") < 0 ||
+            sd_bus_message_open_container(req, 'r', "sa{sv}") < 0 ||
+            sd_bus_message_append(req, "s", "unix-process") < 0 ||
+            sd_bus_message_open_container(req, 'a', "{sv}") < 0 ||
+            sd_bus_message_append(req, "{sv}", "pid", "u", (uint32_t) pid) < 0 ||
+            sd_bus_message_append(req, "{sv}", "start-time", "t", proc_starttime(pid)) < 0 ||
+            sd_bus_message_close_container(req) < 0 ||
+            sd_bus_message_close_container(req) < 0 ||
+            sd_bus_message_append(req, "s", "io.platformd.secret1.verify-fresh") < 0 ||
+            sd_bus_message_append(req, "a{ss}", 0) < 0 ||
+            sd_bus_message_append(req, "us", 1U, "") < 0)
+                return sd_bus_error_set(e, SD_BUS_ERROR_FAILED, "cannot build the authorization request");
+
+        if (!(su = stepup_new(m, xport_session, item, grade, GATE_STALE)))
+                return -ENOMEM;
+        su->refresh_local = true;
+        if (sd_bus_call_async(mgr->system_bus, &su->pk_slot, req, on_polkit_reply, su,
+                              125ULL * 1000000) < 0) {
+                stepup_free(su);
+                return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
+                                        "Fresh verification required (declined)");
+        }
+        return 1;   /* deferred: the reply comes from on_polkit_reply */
+}
+
+static int item_get_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
+        Item *item = userdata;
+        const char *session;
+        CallerGrade grade;
+        int r;
+
+        if ((r = sd_bus_message_read(m, "o", &session)) < 0)
+                return r;
+        grade = caller_grade(m, "secret-read");
+
+        switch (trust_gate(item, grade, m)) {
+        case GATE_ALLOW:
+                return send_item_secret(m, item->path, session);
+        case GATE_STALE:   /* fresh-verification lapsed — async polkit prompt */
+                return stepup_polkit_begin(m, session, item, grade, e);
+        case GATE_TRUSTD:  /* trusted-platform unsatisfied — async platformd-verifyd */
+                return stepup_verifyd_begin(m, session, item, grade, e);
         case GATE_CALLER:
                 return sd_bus_error_set(e, SD_BUS_ERROR_ACCESS_DENIED,
                                         "Caller identity is too weak for this item");
-        case GATE_TRUSTD:
+        case GATE_LOCKED:
+        default:
                 return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
-                                        "Platform is not in a trusted state (platformd-trustd)");
-        case GATE_ALLOW:
-                break;
+                                        "The collection is locked");
         }
-
-        r = sd_bus_message_read(m, "o", &session);
-        if (r < 0)
-                return r;
-        r = sd_bus_message_new_method_return(m, &reply);
-        if (r < 0)
-                return r;
-        r = append_secret(reply, session, item->secret, item->secret_len, item->content_type);
-        if (r < 0)
-                return r;
-        return sd_bus_send(NULL, reply, NULL);
 }
 
 static int item_set_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
@@ -715,6 +874,8 @@ static int item_set_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         size_t plen, vlen;
         int r;
 
+        if ((r = gate_mutation(item, m, e)) < 0)
+                return r;
         r = sd_bus_message_enter_container(m, 'r', "oayays");
         if (r < 0)
                 return r;
@@ -754,7 +915,11 @@ static int item_set_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
 
 static int item_delete(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         Item *item = userdata;
-        /* M2: tombstone — drop from searches/secrets but keep the object valid. */
+        int r;
+
+        if ((r = gate_mutation(item, m, e)) < 0)
+                return r;
+        /* Tombstone: drop from searches/secrets but keep the object valid. */
         item->deleted = true;
         if (item->secret)
                 vault_wipe(item->secret, item->secret_len);
@@ -812,7 +977,13 @@ static int item_set_attributes(sd_bus *bus, const char *path, const char *interf
                                sd_bus_message *value, void *userdata, sd_bus_error *ret_error) {
         Item *item = userdata;
         Attr *attrs = NULL;
-        int r = read_attrs(value, &attrs);
+        int r;
+
+        /* Attributes carry the release policy, so rewriting them is the mutation
+         * that matters most — it is how a policy would be stripped. */
+        if ((r = gate_mutation(item, value, ret_error)) < 0)
+                return r;
+        r = read_attrs(value, &attrs);
         if (r < 0)
                 return r;
         free_attrs(item->attrs);
@@ -858,8 +1029,8 @@ static int manager_register_item(Manager *mgr, Item *item) {
  *
  *   magic "PLTFSECR" | u32 version | u32 cipher | u32 payload_len | payload
  *
- * cipher 0 means the payload is stored in the clear; the vault.c AEAD wrapper
- * (M3) will set cipher 1 and seal the same payload. The payload is:
+ * cipher 0 means the payload is stored in the clear; cipher 1 means the vault.c
+ * AEAD wrapper has sealed it (nonce + tag precede the ciphertext). The payload is:
  *
  *   u32 item_count, then per item:
  *     u64 created, u64 modified, str content_type, str label, bytes secret,
@@ -1098,6 +1269,12 @@ static void manager_save(void) {
 
         if (!mgr || store_path(&path) < 0)
                 return;
+        if (g_store_readonly) {   /* refuse to clobber an unreadable encrypted store */
+                sd_journal_print(LOG_ERR,
+                        "refusing to save: the existing encrypted store could not be opened; "
+                        "changes are in memory only and will not persist");
+                return;
+        }
         if (manager_serialize(mgr, &payload) < 0)
                 goto out;
         if (buf_append(&file, "PLTFSECR", 8) < 0 || buf_u32(&file, 2) < 0)   /* magic, version */
@@ -1217,37 +1394,52 @@ static void manager_load(Manager *mgr) {
         if (rd_raw(&r, magic, 8) < 0 || memcmp(magic, "PLTFSECR", 8) != 0 ||
             rd_u32(&r, &version) < 0 || version != 2 ||
             rd_u32(&r, &cipher) < 0) {
-                sd_journal_print(LOG_WARNING, "ignoring unrecognized store %s", path);
+                /* Foreign file or a newer on-disk version — serve empty, but do not
+                 * overwrite what we could not read. */
+                sd_journal_print(LOG_ERR, "unrecognized store %s — writes disabled to protect it", path);
+                g_store_readonly = true;
                 return;
         }
 
         if (cipher == 0) {
-                if (rd_u32(&r, &plen) < 0 || r.pos + plen > len)
+                if (rd_u32(&r, &plen) < 0 || r.pos + plen > len) {
+                        g_store_readonly = true;   /* malformed — do not overwrite it */
                         return;
+                }
                 manager_deserialize_payload(mgr, data + r.pos, plen);
         } else if (cipher == 1) {
                 uint8_t nonce[VAULT_NONCE_LEN], tag[VAULT_TAG_LEN];
                 _cleanup_free_ uint8_t *pt = NULL;
 
                 if (!g_encrypting) {
-                        sd_journal_print(LOG_WARNING, "store is encrypted but no vault key is loaded");
+                        sd_journal_print(LOG_ERR, "store is encrypted but no vault key is loaded — "
+                                         "serving empty; writes are disabled to protect it");
+                        g_store_readonly = true;
                         return;
                 }
                 if (rd_raw(&r, nonce, sizeof nonce) < 0 || rd_raw(&r, tag, sizeof tag) < 0 ||
-                    rd_u32(&r, &plen) < 0 || r.pos + plen > len)
+                    rd_u32(&r, &plen) < 0 || r.pos + plen > len) {
+                        g_store_readonly = true;
                         return;
+                }
                 pt = malloc(plen ? plen : 1);
-                if (!pt)
+                if (!pt) {
+                        g_store_readonly = true;
                         return;
+                }
                 if (vault_open(g_vault_key, nonce, data + r.pos, plen, tag, pt) < 0) {
-                        sd_journal_print(LOG_ERR, "cannot decrypt store (wrong key or tampered)");
+                        sd_journal_print(LOG_ERR, "cannot decrypt store (wrong key or tampered) — "
+                                         "writes disabled to protect it");
+                        g_store_readonly = true;
                         vault_wipe(pt, plen);
                         return;
                 }
                 manager_deserialize_payload(mgr, pt, plen);
                 vault_wipe(pt, plen);
-        } else
-                sd_journal_print(LOG_WARNING, "unsupported store cipher %u", cipher);
+        } else {
+                sd_journal_print(LOG_ERR, "unsupported store cipher %u — writes disabled to protect it", cipher);
+                g_store_readonly = true;
+        }
 }
 
 /* --- the default collection (org.freedesktop.Secret.Collection) --- */
@@ -1367,6 +1559,9 @@ static int collection_create_item(sd_bus_message *m, void *userdata, sd_bus_erro
                             attrs_equal(i->attrs, attrs)) { item = i; break; }
 
         if (item) {
+                /* replace overwrites an existing item — a protected mutation. */
+                if ((r = gate_mutation(item, m, e)) < 0)
+                        goto fail;
                 free_attrs(item->attrs); item->attrs = attrs; attrs = NULL;
                 free(item->label); item->label = label; label = NULL;
                 if (item->secret) vault_wipe(item->secret, item->secret_len);
@@ -1441,6 +1636,12 @@ static int collection_delete(sd_bus_message *m, void *userdata, sd_bus_error *e)
         if (streq(coll->path, COLLECTION_PATH))
                 return sd_bus_error_set(e, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "The default collection cannot be deleted");
+        /* Deleting a collection destroys its items — refuse if that would destroy
+         * a protected item whose policy is not currently satisfied. */
+        for (Item *it = mgr->items; it; it = it->next)
+                if (!it->deleted && it->collection && streq(it->collection, coll->path) &&
+                    (r = gate_mutation(it, m, e)) < 0)
+                        return r;
         for (Item *it = mgr->items; it; it = it->next)
                 if (!it->deleted && it->collection && streq(it->collection, coll->path)) {
                         it->deleted = true;
@@ -1832,7 +2033,7 @@ static int method_get_secrets(sd_bus_message *m, void *userdata, sd_bus_error *e
                 return sd_bus_send(NULL, empty, NULL);
         }
 
-        CallerGrade grade = caller_grade(m);   /* record & report the caller */
+        CallerGrade grade = caller_grade(m, "secret-read");   /* record & report the caller */
 
         /* in: ao items, o session — collect the paths, then read the session. */
         if ((r = sd_bus_message_enter_container(m, 'a', "o")) < 0)
@@ -1886,7 +2087,7 @@ static int method_read_alias(sd_bus_message *m, void *userdata, sd_bus_error *e)
 }
 
 static int method_set_alias(sd_bus_message *m, void *userdata, sd_bus_error *e) {
-        int r = sd_bus_message_skip(m, "so");   /* M2: fixed default alias */
+        int r = sd_bus_message_skip(m, "so");   /* the default alias is fixed */
         if (r < 0)
                 return r;
         return sd_bus_reply_method_return(m, NULL);
@@ -1926,13 +2127,66 @@ static const sd_bus_vtable service_vtable[] = {
  * The desktop's lock state drives the store's lock state: when the session
  * locks, secrets become unavailable; when it unlocks, they return. logind
  * reports this on the login1 Session object via the Lock/Unlock signals and the
- * LockedHint property. Best-effort: with no graphical session the lock stays
- * manual (the Lock/Unlock methods only).
+ * LockedHint property.
+ *
+ * The signal matches are installed for all session objects and filtered against
+ * mgr->my_session — the login1 path of our display session — which is re-resolved
+ * whenever a session appears or disappears. So tracking survives being started
+ * before the session settles, and a log-out / log-in that changes the session:
+ * it rebinds rather than going deaf. Best-effort: with no graphical session the
+ * lock stays manual (the Lock/Unlock methods only).
  */
+
+/* Is this the session we track? */
+static bool is_my_session(Manager *mgr, sd_bus_message *m) {
+        const char *path = sd_bus_message_get_path(m);
+        return mgr->my_session && path && streq(mgr->my_session, path);
+}
+
+/* Re-resolve our display session's login1 object path via a dedicated (not
+ * event-attached) connection, so the blocking call is safe from inside a signal
+ * dispatch. Updates mgr->my_session and the initial lock state. */
+static void resolve_my_session(Manager *mgr) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_free_ char *session = NULL;
+        const char *p;
+        int locked = 0;
+
+        free(mgr->my_session);
+        mgr->my_session = NULL;
+
+        if (sd_uid_get_display(getuid(), &session) < 0 || sd_bus_open_system(&bus) < 0)
+                return;   /* no graphical session yet */
+        if (sd_bus_call_method(bus, "org.freedesktop.login1", "/org/freedesktop/login1",
+                               "org.freedesktop.login1.Manager", "GetSession",
+                               &error, &reply, "s", session) < 0 ||
+            sd_bus_message_read(reply, "o", &p) < 0 || !(mgr->my_session = strdup(p)))
+                return;
+
+        if (sd_bus_get_property_trivial(bus, "org.freedesktop.login1", mgr->my_session,
+                                        "org.freedesktop.login1.Session", "LockedHint", NULL, 'b', &locked) >= 0) {
+                bool was = collection_locked(mgr);
+                mgr->desktop_locked = locked;
+                if (!locked)
+                        mgr->last_verify = now_mono();
+                if (was != collection_locked(mgr))
+                        emit_locked_changed();
+        }
+}
+
+/* A session appeared or went away — rebind onto our current display session. */
+static int on_sessions_changed(sd_bus_message *m, void *userdata, sd_bus_error *e) {
+        resolve_my_session(userdata);
+        return 0;
+}
 
 static int on_session_lock(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         Manager *mgr = userdata;
         bool was = collection_locked(mgr);
+        if (!is_my_session(mgr, m))
+                return 0;
         mgr->desktop_locked = true;
         if (!was)
                 emit_locked_changed();
@@ -1942,6 +2196,8 @@ static int on_session_lock(sd_bus_message *m, void *userdata, sd_bus_error *e) {
 static int on_session_unlock(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         Manager *mgr = userdata;
         bool was = collection_locked(mgr);
+        if (!is_my_session(mgr, m))
+                return 0;
         mgr->desktop_locked = false;
         mgr->last_verify = now_mono();           /* the screen unlock is the auth */
         if (was != collection_locked(mgr))
@@ -1953,6 +2209,8 @@ static int on_session_props(sd_bus_message *m, void *userdata, sd_bus_error *e) 
         Manager *mgr = userdata;
         const char *iface;
 
+        if (!is_my_session(mgr, m))
+                return 0;
         if (sd_bus_message_read(m, "s", &iface) < 0 ||
             sd_bus_message_enter_container(m, 'a', "{sv}") < 0)
                 return 0;
@@ -1983,36 +2241,29 @@ static int on_session_props(sd_bus_message *m, void *userdata, sd_bus_error *e) 
 }
 
 static void setup_logind_lock(Manager *mgr, sd_event *event) {
-        _cleanup_free_ char *session = NULL, *path = NULL;
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        const char *p;
-        int r, locked = 0;
-
-        if (sd_uid_get_display(getuid(), &session) < 0)
-                return;   /* no graphical session — lock stays manual */
         if (sd_bus_open_system(&mgr->system_bus) < 0 ||
-            sd_bus_attach_event(mgr->system_bus, event, SD_EVENT_PRIORITY_NORMAL) < 0)
-                return;
+            sd_bus_attach_event(mgr->system_bus, event, SD_EVENT_PRIORITY_NORMAL) < 0) {
+                mgr->system_bus = sd_bus_flush_close_unref(mgr->system_bus);
+                return;   /* no system bus — lock stays manual */
+        }
 
-        r = sd_bus_call_method(mgr->system_bus, "org.freedesktop.login1", "/org/freedesktop/login1",
-                               "org.freedesktop.login1.Manager", "GetSession", &error, &reply, "s", session);
-        if (r < 0 || sd_bus_message_read(reply, "o", &p) < 0 || !(path = strdup(p)))
-                return;
-
-        if (sd_bus_get_property_trivial(mgr->system_bus, "org.freedesktop.login1", path,
-                                        "org.freedesktop.login1.Session", "LockedHint", NULL, 'b', &locked) >= 0)
-                mgr->desktop_locked = locked;
-
-        (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", path,
+        /* Match all session objects and filter to ours in the handlers; the set of
+         * sessions (and which is ours) can change over the daemon's lifetime. */
+        (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", NULL,
                                    "org.freedesktop.login1.Session", "Lock", on_session_lock, mgr);
-        (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", path,
+        (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", NULL,
                                    "org.freedesktop.login1.Session", "Unlock", on_session_unlock, mgr);
-        (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", path,
+        (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", NULL,
                                    "org.freedesktop.DBus.Properties", "PropertiesChanged", on_session_props, mgr);
+        (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
+                                   "org.freedesktop.login1.Manager", "SessionNew", on_sessions_changed, mgr);
+        (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
+                                   "org.freedesktop.login1.Manager", "SessionRemoved", on_sessions_changed, mgr);
 
-        sd_journal_print(LOG_INFO, "tracking logind session %s (initial state: %s)",
-                         session, mgr->desktop_locked ? "locked" : "unlocked");
+        resolve_my_session(mgr);
+        sd_journal_print(LOG_INFO, "tracking logind lock state (session %s, initial state: %s)",
+                         mgr->my_session ? mgr->my_session : "none yet",
+                         mgr->desktop_locked ? "locked" : "unlocked");
 }
 
 /* --- Varlink: io.platformd.Secret ------------------------------------------
@@ -2217,8 +2468,10 @@ int main(void) {
                 return EXIT_FAILURE;
         }
 
-        sd_notify(0, "READY=1\n"
-                     "STATUS=Serving org.freedesktop.secrets (persistent store, plaintext)");
+        sd_notifyf(0, "READY=1\n"
+                      "STATUS=Serving org.freedesktop.secrets (persistent store, %s)",
+                   g_store_readonly ? "read-only: store unreadable" :
+                   g_encrypting ? "encrypted" : "plaintext");
         sd_journal_print(LOG_INFO, "claimed %s — serving (%s store)", SECRETS_NAME,
                          g_encrypting ? "encrypted" : "plaintext");
 
@@ -2227,6 +2480,7 @@ int main(void) {
         if (manager.varlink)
                 sd_varlink_server_unref(manager.varlink);
         free(manager.home_storage);
+        free(manager.my_session);
         if (manager.system_bus)
                 sd_bus_flush_close_unref(manager.system_bus);
         if (r < 0)

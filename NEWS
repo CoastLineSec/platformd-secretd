@@ -1,7 +1,35 @@
 platformd-secretd NEWS
 ======================
 
-platformd-secretd 0.0.1 (unreleased)
+platformd-secretd (unreleased)
+
+  Audit hardening:
+
+  * The trust gate now guards protected mutation, not only release: SetSecret,
+    SetAttributes, Delete and a replace-on-CreateItem of an item carrying a
+    platformd.* attribute require that item's policy to be satisfied. This closes
+    a downgrade where a caller could strip an item's policy with SetAttributes
+    and then read it freely. Deleting a collection is refused if it would destroy
+    a gated item whose policy is unsatisfied.
+  * The interactive step-up is asynchronous: a stale fresh-verification or
+    trusted-platform read defers its D-Bus reply and drives the polkit prompt /
+    platformd-verifyd call on the event loop, so a slow reader never freezes the
+    daemon for other clients.
+  * An encrypted store that cannot be opened (no key, wrong key, or a newer /
+    foreign on-disk version) disables writes instead of overwriting it with an
+    empty store — one misconfigured boot no longer destroys the secrets. The unit
+    STATUS reflects encrypted / plaintext / read-only.
+  * logind lock tracking rebinds when the session changes (log out / in), rather
+    than binding once at startup and going deaf.
+
+platformd-secretd 0.1.1
+
+  * Trusted-platform items step up through platformd-verifyd: a stale
+    platformd.policy=trusted-platform read re-verifies presence (fingerprint,
+    face, …) and refreshes platformd-trustd, releasing only if the platform is
+    then trusted. Documentation brought in line with the platformd-trustd gate.
+
+platformd-secretd 0.1.0
 
   First working release of the platform-authentication-aware Secret Service
   provider for org.freedesktop.secrets.
@@ -23,7 +51,7 @@ platformd-secretd 0.0.1 (unreleased)
       homes, e.g. systemd-homed luks/fscrypt). The daemon detects the homed
       storage backend and warns when secrets would sit in the clear on an
       unencrypted home.
-    * The trust gate -- the platform-authentication differentiator:
+    * The trust gate:
         - lock state tracks the desktop session via systemd-logind: locking the
           screen locks the secrets, unlocking restores them. While the session is
           locked, Unlock is refused -- the only key is unlocking the session
