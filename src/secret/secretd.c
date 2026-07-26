@@ -60,6 +60,7 @@ typedef struct Attr {
 
 typedef struct Item {
         struct Item *next;
+        sd_bus_slot *slot;
         char *path;
         char *label;
         Attr *attrs;
@@ -69,11 +70,13 @@ typedef struct Item {
         char *collection;       /* owning collection's object path */
         uint64_t created, modified;
         bool deleted;
+        bool deleting;
 } Item;
 
 typedef struct Session {
         struct Session *next;
         char *path;
+        char *owner;
         sd_bus_slot *slot;      /* the Session object's vtable, unref'd on Close */
         bool encrypted;         /* the session uses the DH transport (else plain) */
         uint8_t aes_key[16];    /* AES-128 transport key when encrypted */
@@ -82,6 +85,7 @@ typedef struct Session {
 typedef struct Prompt {
         struct Prompt *next;
         char *path;
+        char *owner;
         sd_bus_slot *slot;      /* the Prompt object's vtable, unref'd on completion */
 } Prompt;
 
@@ -102,7 +106,7 @@ typedef struct Manager {
         uint64_t coll_created;
         bool desktop_locked;    /* logind session lock (LockedHint / Lock+Unlock) */
         bool manual_locked;     /* explicit Service.Lock */
-        uint64_t last_verify;   /* CLOCK_MONOTONIC secs of the last unlock/verify */
+        uint64_t last_verify;   /* CLOCK_BOOTTIME secs of the last explicit verification */
         sd_bus *system_bus;     /* logind lock tracking */
         char *my_session;       /* login1 object path of our display session, or NULL */
         sd_varlink_server *varlink;   /* io.platformd.Secret admin interface */
@@ -116,19 +120,21 @@ typedef struct Manager {
 /* Single-instance daemon: the running manager, so mutation handlers (which hold
  * only an Item*) can persist without a back-pointer. */
 static Manager *manager_instance;
-static void manager_save(void);
+static int manager_save(void);
 static void manager_load(Manager *mgr);
 static Collection *collection_new(Manager *mgr, const char *path, const char *label);
+static void collection_destroy(Manager *mgr, Collection *collection);
 static const sd_bus_vtable collection_vtable[];
 
 /* The vault key (loaded from a systemd credential); g_encrypting gates sealing. */
 static uint8_t g_vault_key[VAULT_KEY_LEN];
 static bool g_encrypting;
-/* Set when an existing encrypted store could not be opened (no key, wrong key, or
- * tampering). We keep serving from memory but must never save — a blind save
- * would overwrite the unreadable ciphertext with an empty store and destroy it. */
+/* Set when an existing store cannot be read completely. Mutations fail while
+ * this is set so an unreadable store is never replaced with partial state. */
 static bool g_store_readonly;
-static uint64_t g_fresh_window = 300;   /* seconds; fresh-verification window (0 = off) */
+/* A zero window disables cached freshness and leaves fresh-verification items
+ * unavailable. */
+static uint64_t g_fresh_window = 300;
 
 static int fail(const char *what, int r) {
         sd_journal_print(LOG_ERR, "%s: %s", what, strerror(-r));
@@ -137,9 +143,9 @@ static int fail(const char *what, int r) {
 
 static uint64_t now_secs(void) { return (uint64_t) time(NULL); }
 
-static uint64_t now_mono(void) {   /* monotonic seconds, for freshness windows */
+static uint64_t now_boottime(void) {   /* includes time spent suspended */
         struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
+        clock_gettime(CLOCK_BOOTTIME, &ts);
         return (uint64_t) ts.tv_sec;
 }
 
@@ -211,6 +217,37 @@ static const char *attr_get(Attr *list, const char *k) {
         return NULL;
 }
 
+static int validate_platformd_attrs(Attr *attrs, sd_bus_error *error) {
+        bool have_min_grade = false, have_policy = false;
+
+        for (Attr *attr = attrs; attr; attr = attr->next) {
+                if (streq(attr->key, "platformd.policy")) {
+                        if (have_policy)
+                                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                        "platformd.policy is specified more than once");
+                        have_policy = true;
+                        if (!streq(attr->val, "fresh-verification") &&
+                            !streq(attr->val, "trusted-platform"))
+                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                         "unsupported platformd.policy value '%s'",
+                                                         attr->val);
+                } else if (streq(attr->key, "platformd.min-grade")) {
+                        if (have_min_grade)
+                                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                        "platformd.min-grade is specified more than once");
+                        have_min_grade = true;
+                        if (!streq(attr->val, "same-user-weak") &&
+                            !streq(attr->val, "systemd-unit") &&
+                            !streq(attr->val, "sandboxed-app"))
+                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                         "unsupported platformd.min-grade value '%s'",
+                                                         attr->val);
+                }
+        }
+
+        return 0;
+}
+
 /* every entry of `query` must be present with the same value in `attrs`. */
 static bool attrs_match(Attr *attrs, Attr *query) {
         for (Attr *q = query; q; q = q->next) {
@@ -237,34 +274,33 @@ static int append_attrs(sd_bus_message *reply, Attr *attrs) {
         return sd_bus_message_close_container(reply);
 }
 
-static Session *find_session(Manager *m, const char *path) {
-        if (m && path && *path)
+static Session *find_session(Manager *m, const char *path, const char *owner) {
+        if (m && path && *path && owner && *owner)
                 for (Session *s = m->sessions; s; s = s->next)
-                        if (streq(s->path, path))
+                        if (streq(s->path, path) && streq(s->owner, owner))
                                 return s;
         return NULL;
 }
 
 /* Secret Service secret struct: (o session, ay parameters, ay value, s content-type).
  * On a DH session the value is AES-128-CBC encrypted and the IV rides in parameters. */
-static int append_secret(sd_bus_message *reply, const char *session,
+static int append_secret(sd_bus_message *reply, Session *session,
                          const uint8_t *value, size_t len, const char *ct) {
-        Session *sess = find_session(manager_instance, session);
         _cleanup_free_ uint8_t *enc = NULL;
         const uint8_t *params = NULL, *out = value;
         size_t params_len = 0, out_len = len;
         uint8_t iv[VAULT_DH_IV_LEN];
         int r;
 
-        if (sess && sess->encrypted) {
-                if (vault_transport_encrypt(sess->aes_key, value, len, iv, &enc, &out_len) < 0)
+        if (session->encrypted) {
+                if (vault_transport_encrypt(session->aes_key, value, len, iv, &enc, &out_len) < 0)
                         return -EIO;
                 out = enc;
                 params = iv;
                 params_len = VAULT_DH_IV_LEN;
         }
         if ((r = sd_bus_message_open_container(reply, 'r', "oayays")) < 0 ||
-            (r = sd_bus_message_append(reply, "o", (session && *session) ? session : "/")) < 0 ||
+            (r = sd_bus_message_append(reply, "o", session->path)) < 0 ||
             (r = sd_bus_message_append_array(reply, 'y', params, params_len)) < 0 ||
             (r = sd_bus_message_append_array(reply, 'y', out, out_len)) < 0 ||
             (r = sd_bus_message_append(reply, "s", (ct && *ct) ? ct : "text/plain")) < 0)
@@ -345,25 +381,26 @@ static CallerGrade caller_grade(sd_bus_message *m, const char *event) {
         CallerGrade grade = CALLER_UNKNOWN;
         uid_t uid = (uid_t) -1;
         pid_t pid = 0;
-        const char *unit = NULL, *cgroup = NULL;
+        const char *unit = NULL;
 
         if (sd_bus_query_sender_creds(m,
                                       SD_BUS_CREDS_UID | SD_BUS_CREDS_PID |
-                                      SD_BUS_CREDS_USER_UNIT | SD_BUS_CREDS_CGROUP |
-                                      SD_BUS_CREDS_AUGMENT, &creds) < 0 || !creds)
+                                      SD_BUS_CREDS_USER_UNIT | SD_BUS_CREDS_AUGMENT,
+                                      &creds) < 0 || !creds)
                 return CALLER_UNKNOWN;
 
         (void) sd_bus_creds_get_uid(creds, &uid);
         (void) sd_bus_creds_get_pid(creds, &pid);
         (void) sd_bus_creds_get_user_unit(creds, &unit);
-        (void) sd_bus_creds_get_cgroup(creds, &cgroup);
 
-        if ((cgroup && strstr(cgroup, "flatpak")) || (unit && strstr(unit, "flatpak")))
-                grade = CALLER_SANDBOXED_APP;   /* has a sandbox/app identity */
-        else if (unit)
-                grade = CALLER_SYSTEMD_UNIT;    /* belongs to a named user unit */
-        else if (uid != (uid_t) -1)
-                grade = CALLER_SAME_USER_WEAK;  /* ordinary same-uid process */
+        /*
+         * User-unit and cgroup names are caller-controlled metadata, not an
+         * authenticated application identity. Until the service has a
+         * verifiable identity source, every local same-UID caller receives the
+         * weakest grade.
+         */
+        if (uid == getuid())
+                grade = CALLER_SAME_USER_WEAK;
 
         sd_journal_send("MESSAGE=caller graded (%s): uid=%d pid=%d unit=%s grade=%s",
                         event, (int) uid, (int) pid, unit ? unit : "-", caller_grade_name(grade),
@@ -377,11 +414,16 @@ static CallerGrade caller_grade(sd_bus_message *m, const char *event) {
         return grade;
 }
 
-static CallerGrade grade_from_name(const char *s) {
-        if (streq(s, "sandboxed-app"))  return CALLER_SANDBOXED_APP;
-        if (streq(s, "systemd-unit"))   return CALLER_SYSTEMD_UNIT;
-        if (streq(s, "same-user-weak")) return CALLER_SAME_USER_WEAK;
-        return CALLER_UNKNOWN;
+static bool grade_from_name(const char *s, CallerGrade *ret) {
+        if (streq(s, "sandboxed-app"))
+                *ret = CALLER_SANDBOXED_APP;
+        else if (streq(s, "systemd-unit"))
+                *ret = CALLER_SYSTEMD_UNIT;
+        else if (streq(s, "same-user-weak"))
+                *ret = CALLER_SAME_USER_WEAK;
+        else
+                return false;
+        return true;
 }
 
 /* --- the trust gate --------------------------------------------------------
@@ -485,29 +527,45 @@ static int trustd_local_trusted(const char *session) {
  * see the step-up machinery below trust_gate, so a slow reader never blocks the
  * event loop. */
 
-typedef enum { GATE_ALLOW, GATE_LOCKED, GATE_STALE, GATE_CALLER, GATE_TRUSTD } GateResult;
+typedef enum {
+        GATE_ALLOW,
+        GATE_LOCKED,
+        GATE_STALE,
+        GATE_CALLER,
+        GATE_TRUSTD,
+        GATE_POLICY,
+} GateResult;
 
 static GateResult trust_gate(Item *item, CallerGrade grade, sd_bus_message *m) {
         Manager *mgr = manager_instance;
         const char *policy, *mingrade;
+        CallerGrade required;
+        uint64_t now;
 
         if (collection_locked(mgr))
                 return GATE_LOCKED;
 
         policy = attr_get(item->attrs, "platformd.policy");
-        if (policy && streq(policy, "fresh-verification") && g_fresh_window > 0 &&
-            now_mono() - mgr->last_verify > g_fresh_window)
-                return GATE_STALE;
-        if (policy && streq(policy, "trusted-platform")) {
+        if (policy && streq(policy, "fresh-verification")) {
+                now = now_boottime();
+                if (g_fresh_window == 0 || mgr->last_verify == 0 ||
+                    now < mgr->last_verify || now - mgr->last_verify > g_fresh_window)
+                        return GATE_STALE;
+        } else if (policy && streq(policy, "trusted-platform")) {
                 _cleanup_free_ char *session = NULL;
                 (void) caller_session(m, &session);
                 if (trustd_local_trusted(session) != 1)   /* denied or trustd absent */
                         return GATE_TRUSTD;
-        }
+        } else if (policy)
+                return GATE_POLICY;
 
         mingrade = attr_get(item->attrs, "platformd.min-grade");
-        if (mingrade && grade < grade_from_name(mingrade))
-                return GATE_CALLER;
+        if (mingrade) {
+                if (!grade_from_name(mingrade, &required))
+                        return GATE_POLICY;
+                if (grade < required)
+                        return GATE_CALLER;
+        }
 
         return GATE_ALLOW;
 }
@@ -659,17 +717,37 @@ static void stepup_free(StepUp *su) {
         free(su);
 }
 
+static Session *message_session(sd_bus_message *message, const char *path, sd_bus_error *error) {
+        const char *sender = sd_bus_message_get_sender(message);
+        Session *session;
+
+        if (!sender) {
+                sd_bus_error_set(error, SD_BUS_ERROR_ACCESS_DENIED,
+                                 "Cannot determine the D-Bus caller");
+                return NULL;
+        }
+        session = find_session(manager_instance, path, sender);
+        if (!session)
+                sd_bus_error_set(error, SD_BUS_ERROR_ACCESS_DENIED,
+                                 "The session does not belong to the caller");
+        return session;
+}
+
 /* Send the GetSecret reply for an item, or a clean error if it is gone. */
 static int send_item_secret(sd_bus_message *call, const char *item_path, const char *xport_session) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         Item *item = manager_find_by_path(manager_instance, item_path);
+        Session *session;
         int r;
 
         if (!item)
                 return sd_bus_reply_method_errorf(call, "org.freedesktop.Secret.Error.NoSuchObject",
                                                   "The item no longer exists");
+        if (!(session = message_session(call, xport_session, &error)))
+                return sd_bus_reply_method_error(call, &error);
         if ((r = sd_bus_message_new_method_return(call, &reply)) < 0 ||
-            (r = append_secret(reply, xport_session, item->secret, item->secret_len, item->content_type)) < 0)
+            (r = append_secret(reply, session, item->secret, item->secret_len, item->content_type)) < 0)
                 return sd_bus_reply_method_errorf(call, SD_BUS_ERROR_FAILED, "%s", strerror(-r));
         return sd_bus_send(NULL, reply, NULL);
 }
@@ -686,6 +764,9 @@ static int reply_gate_error(sd_bus_message *call, GateResult g) {
         case GATE_TRUSTD:
                 return sd_bus_reply_method_errorf(call, "org.freedesktop.Secret.Error.IsLocked",
                                                   "Platform is not in a trusted state (platformd-trustd)");
+        case GATE_POLICY:
+                return sd_bus_reply_method_errorf(call, SD_BUS_ERROR_ACCESS_DENIED,
+                                                  "The item has an unsupported release policy");
         default:   /* GATE_LOCKED, or anything unexpected */
                 return sd_bus_reply_method_errorf(call, "org.freedesktop.Secret.Error.IsLocked",
                                                   "The collection is locked");
@@ -706,7 +787,7 @@ static void stepup_complete(StepUp *su, bool proved) {
                 return;
         }
         if (su->refresh_local)
-                mgr->last_verify = now_mono();
+                mgr->last_verify = now_boottime();
         item = manager_find_by_path(mgr, su->item_path);
         if (!item)
                 (void) sd_bus_reply_method_errorf(su->call, "org.freedesktop.Secret.Error.NoSuchObject",
@@ -860,6 +941,9 @@ static int item_get_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         case GATE_CALLER:
                 return sd_bus_error_set(e, SD_BUS_ERROR_ACCESS_DENIED,
                                         "Caller identity is too weak for this item");
+        case GATE_POLICY:
+                return sd_bus_error_set(e, SD_BUS_ERROR_ACCESS_DENIED,
+                                        "The item has an unsupported release policy");
         case GATE_LOCKED:
         default:
                 return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
@@ -867,11 +951,20 @@ static int item_get_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         }
 }
 
+static int persist_error(sd_bus_error *error, int r) {
+        return sd_bus_error_setf(error, SD_BUS_ERROR_FAILED,
+                                 "Failed to persist the secret store: %s", strerror(-r));
+}
+
 static int item_set_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         Item *item = userdata;
         const char *session, *ct;
         const void *params, *value;
         size_t plen, vlen;
+        uint8_t *old_secret, *new_secret;
+        char *old_content_type, *new_content_type;
+        size_t old_secret_len;
+        uint64_t old_modified;
         int r;
 
         if ((r = gate_mutation(item, m, e)) < 0)
@@ -888,11 +981,13 @@ static int item_set_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         if (r < 0)
                 return r;
 
-        Session *sess = find_session(manager_instance, session);
+        Session *sess = message_session(m, session, e);
         _cleanup_free_ uint8_t *dec = NULL;
         const uint8_t *store = value;
         size_t store_len = vlen;
-        if (sess && sess->encrypted) {   /* DH session: value is AES-128-CBC, IV in parameters */
+        if (!sess)
+                return -EACCES;
+        if (sess->encrypted) {   /* DH session: value is AES-128-CBC, IV in parameters */
                 if (plen != VAULT_DH_IV_LEN ||
                     vault_transport_decrypt(sess->aes_key, params, value, vlen, &dec, &store_len) < 0)
                         return sd_bus_error_set(e, SD_BUS_ERROR_INVALID_ARGS,
@@ -900,15 +995,39 @@ static int item_set_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
                 store = dec;
         }
 
-        if (item->secret)
-                vault_wipe(item->secret, item->secret_len);
-        free(item->secret);
-        item->secret = memdup(store, store_len);
+        new_secret = memdup(store, store_len);
+        if (dec)
+                vault_wipe(dec, store_len);
+        new_content_type = strdup((ct && *ct) ? ct : "text/plain");
+        if (!new_secret || !new_content_type) {
+                free(new_secret);
+                free(new_content_type);
+                return -ENOMEM;
+        }
+
+        old_secret = item->secret;
+        old_secret_len = item->secret_len;
+        old_content_type = item->content_type;
+        old_modified = item->modified;
+        item->secret = new_secret;
         item->secret_len = store_len;
-        free(item->content_type);
-        item->content_type = strdup((ct && *ct) ? ct : "text/plain");
+        item->content_type = new_content_type;
         item->modified = now_secs();
-        manager_save();
+        if ((r = manager_save()) < 0) {
+                item->secret = old_secret;
+                item->secret_len = old_secret_len;
+                item->content_type = old_content_type;
+                item->modified = old_modified;
+                vault_wipe(new_secret, store_len);
+                free(new_secret);
+                free(new_content_type);
+                return persist_error(e, r);
+        }
+
+        if (old_secret)
+                vault_wipe(old_secret, old_secret_len);
+        free(old_secret);
+        free(old_content_type);
         emit_item_signal(item->collection, "ItemChanged", item->path, false);
         return sd_bus_reply_method_return(m, NULL);
 }
@@ -921,12 +1040,15 @@ static int item_delete(sd_bus_message *m, void *userdata, sd_bus_error *e) {
                 return r;
         /* Tombstone: drop from searches/secrets but keep the object valid. */
         item->deleted = true;
+        if ((r = manager_save()) < 0) {
+                item->deleted = false;
+                return persist_error(e, r);
+        }
         if (item->secret)
                 vault_wipe(item->secret, item->secret_len);
         free(item->secret);
         item->secret = NULL;
         item->secret_len = 0;
-        manager_save();
         emit_item_signal(item->collection, "ItemDeleted", item->path, true);
         return sd_bus_reply_method_return(m, "o", "/");
 }
@@ -960,14 +1082,28 @@ static int item_get_modified(sd_bus *b, const char *p, const char *i, const char
 static int item_set_label(sd_bus *bus, const char *path, const char *interface, const char *property,
                           sd_bus_message *value, void *userdata, sd_bus_error *ret_error) {
         Item *item = userdata;
+        _cleanup_free_ char *new_label = NULL;
+        char *old_label;
+        uint64_t old_modified;
         const char *l;
         int r = sd_bus_message_read(value, "s", &l);
         if (r < 0)
                 return r;
-        free(item->label);
-        item->label = strdup(l ? l : "");
+        if (!(new_label = strdup(l ? l : "")))
+                return -ENOMEM;
+
+        old_label = item->label;
+        old_modified = item->modified;
+        item->label = new_label;
         item->modified = now_secs();
-        manager_save();
+        if ((r = manager_save()) < 0) {
+                item->label = old_label;
+                item->modified = old_modified;
+                return persist_error(ret_error, r);
+        }
+
+        new_label = NULL;
+        free(old_label);
         (void) sd_bus_emit_properties_changed(bus, path, interface, "Modified", NULL);
         emit_item_signal(item->collection, "ItemChanged", item->path, false);
         return 1;
@@ -977,6 +1113,8 @@ static int item_set_attributes(sd_bus *bus, const char *path, const char *interf
                                sd_bus_message *value, void *userdata, sd_bus_error *ret_error) {
         Item *item = userdata;
         Attr *attrs = NULL;
+        Attr *old_attrs;
+        uint64_t old_modified;
         int r;
 
         /* Attributes carry the release policy, so rewriting them is the mutation
@@ -986,10 +1124,23 @@ static int item_set_attributes(sd_bus *bus, const char *path, const char *interf
         r = read_attrs(value, &attrs);
         if (r < 0)
                 return r;
-        free_attrs(item->attrs);
+        if ((r = validate_platformd_attrs(attrs, ret_error)) < 0) {
+                free_attrs(attrs);
+                return r;
+        }
+
+        old_attrs = item->attrs;
+        old_modified = item->modified;
         item->attrs = attrs;
         item->modified = now_secs();
-        manager_save();
+        if ((r = manager_save()) < 0) {
+                item->attrs = old_attrs;
+                item->modified = old_modified;
+                free_attrs(attrs);
+                return persist_error(ret_error, r);
+        }
+
+        free_attrs(old_attrs);
         (void) sd_bus_emit_properties_changed(bus, path, interface, "Modified", NULL);
         emit_item_signal(item->collection, "ItemChanged", item->path, false);
         return 1;
@@ -1008,12 +1159,34 @@ static const sd_bus_vtable item_vtable[] = {
         SD_BUS_VTABLE_END
 };
 
+static void item_destroy(Manager *manager, Item *item) {
+        if (!item)
+                return;
+
+        for (Item **p = &manager->items; *p; p = &(*p)->next)
+                if (*p == item) {
+                        *p = item->next;
+                        break;
+                }
+
+        sd_bus_slot_unref(item->slot);
+        free_attrs(item->attrs);
+        if (item->secret)
+                vault_wipe(item->secret, item->secret_len);
+        free(item->secret);
+        free(item->content_type);
+        free(item->collection);
+        free(item->label);
+        free(item->path);
+        free(item);
+}
+
 static int manager_register_item(Manager *mgr, Item *item) {
         int r;
         if (asprintf(&item->path, "%s/%" PRIu64,
                      item->collection ? item->collection : COLLECTION_PATH, ++mgr->item_seq) < 0)
                 return -ENOMEM;
-        r = sd_bus_add_object_vtable(mgr->bus, NULL, item->path,
+        r = sd_bus_add_object_vtable(mgr->bus, &item->slot, item->path,
                                      "org.freedesktop.Secret.Item", item_vtable, item);
         if (r < 0)
                 return r;
@@ -1039,12 +1212,24 @@ static int manager_register_item(Manager *mgr, Item *item) {
  * (str/bytes are u32-length-prefixed.)
  */
 
+#define STORE_MAX_BYTES (64u * 1024 * 1024)
+
 typedef struct Buf { uint8_t *data; size_t len, cap; } Buf;
 
 static int buf_append(Buf *b, const void *p, size_t n) {
+        if (n > STORE_MAX_BYTES || b->len > STORE_MAX_BYTES - n)
+                return -EFBIG;
+        if (n == 0)
+                return 0;
         if (b->len + n > b->cap) {
                 size_t nc = b->cap ? b->cap : 256;
-                while (nc < b->len + n) nc *= 2;
+                while (nc < b->len + n) {
+                        if (nc > STORE_MAX_BYTES / 2) {
+                                nc = STORE_MAX_BYTES;
+                                break;
+                        }
+                        nc *= 2;
+                }
                 uint8_t *d = realloc(b->data, nc);
                 if (!d)
                         return -ENOMEM;
@@ -1058,6 +1243,8 @@ static int buf_append(Buf *b, const void *p, size_t n) {
 static int buf_u32(Buf *b, uint32_t v) { return buf_append(b, &v, sizeof v); }
 static int buf_u64(Buf *b, uint64_t v) { return buf_append(b, &v, sizeof v); }
 static int buf_bytes(Buf *b, const void *p, size_t n) {
+        if (n > UINT32_MAX)
+                return -EFBIG;
         int r = buf_u32(b, (uint32_t) n);
         return r < 0 ? r : buf_append(b, p, n);
 }
@@ -1125,27 +1312,29 @@ static int write_atomic(const char *path, const uint8_t *data, size_t len, mode_
         int fd, r = 0;
         size_t off = 0;
 
-        if (asprintf(&tmp, "%s.tmp", path) < 0)
+        if (asprintf(&tmp, "%s.tmp.XXXXXX", path) < 0)
                 return -ENOMEM;
-        fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+        fd = mkostemp(tmp, O_CLOEXEC);
         if (fd < 0)
                 return -errno;
-        while (off < len) {
+        if (fchmod(fd, mode) < 0)
+                r = -errno;
+        while (r == 0 && off < len) {
                 ssize_t w = write(fd, data + off, len - off);
                 if (w < 0) { r = -errno; break; }
+                if (w == 0) { r = -EIO; break; }
                 off += (size_t) w;
         }
         if (r == 0 && fsync(fd) < 0)
                 r = -errno;
-        (void) close(fd);
+        if (close(fd) < 0 && r == 0)
+                r = -errno;
         if (r == 0 && rename(tmp, path) < 0)
                 r = -errno;
         if (r < 0)
                 (void) unlink(tmp);
         return r;
 }
-
-#define STORE_MAX_BYTES (64u * 1024 * 1024)   /* refuse absurd store/key files */
 
 static int read_file(const char *path, uint8_t **data, size_t *len) {
         struct stat st;
@@ -1261,41 +1450,50 @@ static int manager_serialize(Manager *mgr, Buf *out) {
         return 0;
 }
 
-static void manager_save(void) {
+static int manager_save(void) {
         Manager *mgr = manager_instance;
         _cleanup_free_ char *path = NULL;
         Buf payload = {0}, file = {0};
         uint8_t *ct = NULL;
+        int r;
 
-        if (!mgr || store_path(&path) < 0)
-                return;
-        if (g_store_readonly) {   /* refuse to clobber an unreadable encrypted store */
+        if (!mgr)
+                return -ENXIO;
+        if ((r = store_path(&path)) < 0)
+                return r;
+        if (g_store_readonly) {   /* refuse to clobber an unreadable store */
                 sd_journal_print(LOG_ERR,
-                        "refusing to save: the existing encrypted store could not be opened; "
-                        "changes are in memory only and will not persist");
-                return;
+                                 "refusing to save: the existing store could not be read");
+                return -EROFS;
         }
-        if (manager_serialize(mgr, &payload) < 0)
+        if ((r = manager_serialize(mgr, &payload)) < 0)
                 goto out;
-        if (buf_append(&file, "PLTFSECR", 8) < 0 || buf_u32(&file, 2) < 0)   /* magic, version */
+        if ((r = buf_append(&file, "PLTFSECR", 8)) < 0 ||
+            (r = buf_u32(&file, 2)) < 0)   /* magic, version */
                 goto out;
 
         if (g_encrypting) {
                 uint8_t nonce[VAULT_NONCE_LEN], tag[VAULT_TAG_LEN];
                 ct = malloc(payload.len ? payload.len : 1);
-                if (!ct || vault_seal(g_vault_key, payload.data, payload.len, nonce, ct, tag) < 0)
+                if (!ct) {
+                        r = -ENOMEM;
                         goto out;
-                if (buf_u32(&file, 1) < 0 ||                             /* cipher: aes-256-gcm */
-                    buf_append(&file, nonce, VAULT_NONCE_LEN) < 0 ||
-                    buf_append(&file, tag, VAULT_TAG_LEN) < 0 ||
-                    buf_bytes(&file, ct, payload.len) < 0)
+                }
+                if (vault_seal(g_vault_key, payload.data, payload.len, nonce, ct, tag) < 0) {
+                        r = -EIO;
+                        goto out;
+                }
+                if ((r = buf_u32(&file, 1)) < 0 ||                       /* cipher: aes-256-gcm */
+                    (r = buf_append(&file, nonce, VAULT_NONCE_LEN)) < 0 ||
+                    (r = buf_append(&file, tag, VAULT_TAG_LEN)) < 0 ||
+                    (r = buf_bytes(&file, ct, payload.len)) < 0)
                         goto out;
         } else {
-                if (buf_u32(&file, 0) < 0 ||                             /* cipher: none */
-                    buf_bytes(&file, payload.data, payload.len) < 0)
+                if ((r = buf_u32(&file, 0)) < 0 ||                       /* cipher: none */
+                    (r = buf_bytes(&file, payload.data, payload.len)) < 0)
                         goto out;
         }
-        (void) write_atomic(path, file.data, file.len, 0600);
+        r = write_atomic(path, file.data, file.len, 0600);
 out:
         if (ct) {
                 vault_wipe(ct, payload.len);
@@ -1304,80 +1502,117 @@ out:
         if (payload.data)
                 vault_wipe(payload.data, payload.len);   /* held every secret in the clear */
         free(payload.data);
+        if (!g_encrypting && file.data)
+                vault_wipe(file.data, file.len);
         free(file.data);
+        return r;
 }
 
 /* Parse a decrypted payload buffer into items, registering each. */
-static void manager_deserialize_payload(Manager *mgr, const uint8_t *payload, size_t plen) {
+static int manager_deserialize_payload(Manager *mgr, const uint8_t *payload, size_t plen) {
         Rd p = { payload, plen, 0 };
+        Collection *collections_before = mgr->collections;
+        Item *items_before = mgr->items;
         uint32_t cn, n;
+        int r;
 
         /* collections (v2): recreate each and register its object. */
-        if (rd_u32(&p, &cn) < 0)
-                return;
+        if ((r = rd_u32(&p, &cn)) < 0)
+                goto fail;
         for (uint32_t k = 0; k < cn; k++) {
                 uint8_t *cpath = NULL, *clabel = NULL;
                 uint64_t created = 0, modified = 0;
                 Collection *c;
 
-                if (rd_bytes(&p, &cpath, NULL) < 0 || rd_bytes(&p, &clabel, NULL) < 0 ||
-                    rd_u64(&p, &created) < 0 || rd_u64(&p, &modified) < 0) {
+                if ((r = rd_bytes(&p, &cpath, NULL)) < 0 ||
+                    (r = rd_bytes(&p, &clabel, NULL)) < 0 ||
+                    (r = rd_u64(&p, &created)) < 0 ||
+                    (r = rd_u64(&p, &modified)) < 0) {
                         free(cpath); free(clabel);
-                        return;
+                        goto fail;
                 }
                 c = collection_new(mgr, (char *) cpath, (char *) clabel);
                 free(cpath); free(clabel);
-                if (!c)
-                        return;
+                if (!c) {
+                        r = -ENOMEM;
+                        goto fail;
+                }
                 c->created = created;
                 c->modified = modified;
-                (void) sd_bus_add_object_vtable(mgr->bus, &c->slot, c->path,
-                                                "org.freedesktop.Secret.Collection", collection_vtable, c);
+                r = sd_bus_add_object_vtable(mgr->bus, &c->slot, c->path,
+                                             "org.freedesktop.Secret.Collection", collection_vtable, c);
+                if (r < 0) {
+                        collection_destroy(mgr, c);
+                        goto fail;
+                }
         }
 
-        if (rd_u32(&p, &n) < 0)
-                return;
+        if ((r = rd_u32(&p, &n)) < 0)
+                goto fail;
         for (uint32_t k = 0; k < n; k++) {
                 Item *it = calloc(1, sizeof *it);
                 uint8_t *ct = NULL, *lbl = NULL, *coll = NULL, *val = NULL;
                 size_t vl = 0;
                 uint32_t ac = 0;
                 Attr *tail = NULL;
-                bool bad = false;
 
-                if (!it)
-                        return;
-                if (rd_u64(&p, &it->created) < 0 || rd_u64(&p, &it->modified) < 0 ||
-                    rd_bytes(&p, &ct, NULL) < 0 || rd_bytes(&p, &lbl, NULL) < 0 ||
-                    rd_bytes(&p, &coll, NULL) < 0 ||
-                    rd_bytes(&p, &val, &vl) < 0 || rd_u32(&p, &ac) < 0) {
+                if (!it) {
+                        r = -ENOMEM;
+                        goto fail;
+                }
+                if ((r = rd_u64(&p, &it->created)) < 0 ||
+                    (r = rd_u64(&p, &it->modified)) < 0 ||
+                    (r = rd_bytes(&p, &ct, NULL)) < 0 ||
+                    (r = rd_bytes(&p, &lbl, NULL)) < 0 ||
+                    (r = rd_bytes(&p, &coll, NULL)) < 0 ||
+                    (r = rd_bytes(&p, &val, &vl)) < 0 ||
+                    (r = rd_u32(&p, &ac)) < 0) {
                         free(ct); free(lbl); free(coll); free(val); free(it);
-                        return;
+                        goto fail;
                 }
                 it->content_type = (char *) ct;
                 it->label = (char *) lbl;
                 it->collection = (char *) coll;
                 it->secret = val;
                 it->secret_len = vl;
-                for (uint32_t j = 0; j < ac && !bad; j++) {
+                for (uint32_t j = 0; j < ac; j++) {
                         uint8_t *key = NULL, *v = NULL;
                         Attr *a;
-                        if (rd_bytes(&p, &key, NULL) < 0 || rd_bytes(&p, &v, NULL) < 0 ||
-                            !(a = calloc(1, sizeof *a))) {
-                                free(key); free(v); bad = true; break;
+                        if ((r = rd_bytes(&p, &key, NULL)) < 0 ||
+                            (r = rd_bytes(&p, &v, NULL)) < 0) {
+                                free(key); free(v);
+                                item_destroy(mgr, it);
+                                goto fail;
+                        }
+                        if (!(a = calloc(1, sizeof *a))) {
+                                free(key); free(v);
+                                item_destroy(mgr, it);
+                                r = -ENOMEM;
+                                goto fail;
                         }
                         a->key = (char *) key;
                         a->val = (char *) v;
                         if (tail) tail->next = a; else it->attrs = a;
                         tail = a;
                 }
-                if (bad || manager_register_item(mgr, it) < 0) {
-                        free_attrs(it->attrs);
-                        free(it->content_type); free(it->label); free(it->secret);
-                        free(it->collection); free(it->path); free(it);
-                        return;
+                if ((r = manager_register_item(mgr, it)) < 0) {
+                        item_destroy(mgr, it);
+                        goto fail;
                 }
         }
+
+        if (p.pos != p.len) {
+                r = -EBADMSG;
+                goto fail;
+        }
+        return 0;
+
+fail:
+        while (mgr->items != items_before)
+                item_destroy(mgr, mgr->items);
+        while (mgr->collections != collections_before)
+                collection_destroy(mgr, mgr->collections);
+        return r;
 }
 
 static void manager_load(Manager *mgr) {
@@ -1386,9 +1621,21 @@ static void manager_load(Manager *mgr) {
         size_t len = 0;
         uint32_t version, cipher, plen;
         char magic[8];
+        int e;
 
-        if (store_path(&path) < 0 || read_file(path, &data, &len) < 0)
-                return;   /* no store yet — first run */
+        if ((e = store_path(&path)) < 0) {
+                sd_journal_print(LOG_ERR, "cannot determine the secret store path: %s", strerror(-e));
+                g_store_readonly = true;
+                return;
+        }
+        if ((e = read_file(path, &data, &len)) < 0) {
+                if (e == -ENOENT)
+                        return;   /* no store yet — first run */
+                sd_journal_print(LOG_ERR, "cannot read secret store %s: %s; writes disabled",
+                                 path, strerror(-e));
+                g_store_readonly = true;
+                return;
+        }
 
         Rd r = { data, len, 0 };
         if (rd_raw(&r, magic, 8) < 0 || memcmp(magic, "PLTFSECR", 8) != 0 ||
@@ -1402,11 +1649,11 @@ static void manager_load(Manager *mgr) {
         }
 
         if (cipher == 0) {
-                if (rd_u32(&r, &plen) < 0 || r.pos + plen > len) {
+                if (rd_u32(&r, &plen) < 0 || r.pos + plen != len) {
                         g_store_readonly = true;   /* malformed — do not overwrite it */
                         return;
                 }
-                manager_deserialize_payload(mgr, data + r.pos, plen);
+                e = manager_deserialize_payload(mgr, data + r.pos, plen);
         } else if (cipher == 1) {
                 uint8_t nonce[VAULT_NONCE_LEN], tag[VAULT_TAG_LEN];
                 _cleanup_free_ uint8_t *pt = NULL;
@@ -1418,7 +1665,7 @@ static void manager_load(Manager *mgr) {
                         return;
                 }
                 if (rd_raw(&r, nonce, sizeof nonce) < 0 || rd_raw(&r, tag, sizeof tag) < 0 ||
-                    rd_u32(&r, &plen) < 0 || r.pos + plen > len) {
+                    rd_u32(&r, &plen) < 0 || r.pos + plen != len) {
                         g_store_readonly = true;
                         return;
                 }
@@ -1434,10 +1681,17 @@ static void manager_load(Manager *mgr) {
                         vault_wipe(pt, plen);
                         return;
                 }
-                manager_deserialize_payload(mgr, pt, plen);
+                e = manager_deserialize_payload(mgr, pt, plen);
                 vault_wipe(pt, plen);
         } else {
                 sd_journal_print(LOG_ERR, "unsupported store cipher %u — writes disabled to protect it", cipher);
+                g_store_readonly = true;
+                return;
+        }
+
+        if (e < 0) {
+                sd_journal_print(LOG_ERR, "cannot parse secret store %s: %s; writes disabled",
+                                 path, strerror(-e));
                 g_store_readonly = true;
         }
 }
@@ -1522,6 +1776,8 @@ static int collection_create_item(sd_bus_message *m, void *userdata, sd_bus_erro
         }
         if ((r = sd_bus_message_exit_container(m)) < 0)
                 goto fail;
+        if ((r = validate_platformd_attrs(attrs, e)) < 0)
+                goto fail;
 
         /* secret (oayays) */
         if ((r = sd_bus_message_enter_container(m, 'r', "oayays")) < 0)
@@ -1537,8 +1793,12 @@ static int collection_create_item(sd_bus_message *m, void *userdata, sd_bus_erro
         /* DH session: the incoming value is AES-128-CBC, IV in parameters. */
         store = value;
         store_len = vlen;
-        sess = find_session(mgr, session);
-        if (sess && sess->encrypted) {
+        sess = message_session(m, session, e);
+        if (!sess) {
+                r = -EACCES;
+                goto fail;
+        }
+        if (sess->encrypted) {
                 if (plen != VAULT_DH_IV_LEN ||
                     vault_transport_decrypt(sess->aes_key, params, value, vlen, &dec, &store_len) < 0) {
                         r = -EINVAL;
@@ -1559,39 +1819,110 @@ static int collection_create_item(sd_bus_message *m, void *userdata, sd_bus_erro
                             attrs_equal(i->attrs, attrs)) { item = i; break; }
 
         if (item) {
+                Attr *old_attrs;
+                uint8_t *old_secret, *new_secret;
+                char *old_label, *old_content_type, *new_content_type;
+                size_t old_secret_len;
+                uint64_t old_modified;
+
                 /* replace overwrites an existing item — a protected mutation. */
                 if ((r = gate_mutation(item, m, e)) < 0)
                         goto fail;
-                free_attrs(item->attrs); item->attrs = attrs; attrs = NULL;
-                free(item->label); item->label = label; label = NULL;
-                if (item->secret) vault_wipe(item->secret, item->secret_len);
-                free(item->secret); item->secret = memdup(store, store_len); item->secret_len = store_len;
-                free(item->content_type); item->content_type = strdup((ct && *ct) ? ct : "text/plain");
+
+                if (!label && !(label = strdup(""))) {
+                        r = -ENOMEM;
+                        goto fail;
+                }
+                new_secret = memdup(store, store_len);
+                new_content_type = strdup((ct && *ct) ? ct : "text/plain");
+                if (!new_secret || !new_content_type) {
+                        free(new_secret);
+                        free(new_content_type);
+                        r = -ENOMEM;
+                        goto fail;
+                }
+
+                old_attrs = item->attrs;
+                old_label = item->label;
+                old_secret = item->secret;
+                old_secret_len = item->secret_len;
+                old_content_type = item->content_type;
+                old_modified = item->modified;
+                item->attrs = attrs;
+                attrs = NULL;
+                item->label = label;
+                label = NULL;
+                item->secret = new_secret;
+                item->secret_len = store_len;
+                item->content_type = new_content_type;
                 item->modified = now_secs();
+
+                if ((r = manager_save()) < 0) {
+                        Attr *failed_attrs = item->attrs;
+                        char *failed_label = item->label;
+
+                        item->attrs = old_attrs;
+                        item->label = old_label;
+                        item->secret = old_secret;
+                        item->secret_len = old_secret_len;
+                        item->content_type = old_content_type;
+                        item->modified = old_modified;
+                        free_attrs(failed_attrs);
+                        free(failed_label);
+                        vault_wipe(new_secret, store_len);
+                        free(new_secret);
+                        free(new_content_type);
+                        r = persist_error(e, r);
+                        goto fail;
+                }
+
+                free_attrs(old_attrs);
+                free(old_label);
+                if (old_secret)
+                        vault_wipe(old_secret, old_secret_len);
+                free(old_secret);
+                free(old_content_type);
         } else {
                 item = calloc(1, sizeof *item);
                 if (!item) { r = -ENOMEM; goto fail; }
+                if (!label && !(label = strdup(""))) {
+                        free(item);
+                        r = -ENOMEM;
+                        goto fail;
+                }
                 item->label = label; label = NULL;
                 item->attrs = attrs; attrs = NULL;
                 item->secret = memdup(store, store_len); item->secret_len = store_len;
                 item->content_type = strdup((ct && *ct) ? ct : "text/plain");
                 item->collection = strdup(coll->path);
                 item->created = item->modified = now_secs();
+                if (!item->secret || !item->content_type || !item->collection) {
+                        item_destroy(mgr, item);
+                        r = -ENOMEM;
+                        goto fail;
+                }
                 if ((r = manager_register_item(mgr, item)) < 0) {
-                        free_attrs(item->attrs); free(item->label); free(item->secret);
-                        free(item->content_type); free(item->collection); free(item->path); free(item);
+                        item_destroy(mgr, item);
                         goto fail;
                 }
                 created = true;
+                if ((r = manager_save()) < 0) {
+                        item_destroy(mgr, item);
+                        r = persist_error(e, r);
+                        goto fail;
+                }
         }
 
-        manager_save();
         emit_item_signal(item->collection, created ? "ItemCreated" : "ItemChanged", item->path, created);
+        if (dec)
+                vault_wipe(dec, store_len);
         free(dec);
         return sd_bus_reply_method_return(m, "oo", item->path, "/");
 
 fail:
         free_attrs(attrs);
+        if (dec)
+                vault_wipe(dec, store_len);
         free(dec);
         return r;
 }
@@ -1631,6 +1962,7 @@ static int collection_search_items(sd_bus_message *m, void *userdata, sd_bus_err
 static int collection_delete(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         Collection *coll = userdata;
         Manager *mgr = manager_instance;
+        Collection **link;
         int r;
 
         if (streq(coll->path, COLLECTION_PATH))
@@ -1642,9 +1974,34 @@ static int collection_delete(sd_bus_message *m, void *userdata, sd_bus_error *e)
                 if (!it->deleted && it->collection && streq(it->collection, coll->path) &&
                     (r = gate_mutation(it, m, e)) < 0)
                         return r;
+
         for (Item *it = mgr->items; it; it = it->next)
                 if (!it->deleted && it->collection && streq(it->collection, coll->path)) {
                         it->deleted = true;
+                        it->deleting = true;
+                }
+
+        for (link = &mgr->collections; *link && *link != coll; link = &(*link)->next)
+                ;
+        if (!*link)
+                return sd_bus_error_set(e, SD_BUS_ERROR_FAILED,
+                                        "The collection is no longer registered");
+        *link = coll->next;
+
+        if ((r = manager_save()) < 0) {
+                coll->next = *link;
+                *link = coll;
+                for (Item *it = mgr->items; it; it = it->next)
+                        if (it->deleting) {
+                                it->deleted = false;
+                                it->deleting = false;
+                        }
+                return persist_error(e, r);
+        }
+
+        for (Item *it = mgr->items; it; it = it->next)
+                if (it->deleting) {
+                        it->deleting = false;
                         if (it->secret)
                                 vault_wipe(it->secret, it->secret_len);
                         free(it->secret);
@@ -1656,7 +2013,6 @@ static int collection_delete(sd_bus_message *m, void *userdata, sd_bus_error *e)
                                   "CollectionDeleted", "o", coll->path);
         (void) sd_bus_emit_properties_changed(mgr->bus, SECRETS_PATH,
                                               "org.freedesktop.Secret.Service", "Collections", NULL);
-        manager_save();
         r = sd_bus_reply_method_return(m, "o", "/");
         collection_destroy(mgr, coll);
         return r;
@@ -1714,18 +2070,29 @@ static const sd_bus_vtable collection_vtable[] = {
 
 /* --- sessions (org.freedesktop.Secret.Session) --- */
 
-static int method_session_close(sd_bus_message *m, void *userdata, sd_bus_error *e) {
-        Session *sess = userdata, **pp;
-        Manager *mgr = manager_instance;
+static void session_free(Manager *manager, Session *session) {
+        for (Session **p = &manager->sessions; *p; p = &(*p)->next)
+                if (*p == session) {
+                        *p = session->next;
+                        break;
+                }
 
-        if (sess && mgr) {
-                for (pp = &mgr->sessions; *pp; pp = &(*pp)->next)
-                        if (*pp == sess) { *pp = sess->next; break; }
-                vault_wipe(sess->aes_key, sizeof sess->aes_key);
-                (void) sd_bus_slot_unref(sess->slot);   /* removes the Session object */
-                free(sess->path);
-                free(sess);
-        }
+        sd_bus_slot_unref(session->slot);
+        vault_wipe(session->aes_key, sizeof session->aes_key);
+        free(session->owner);
+        free(session->path);
+        free(session);
+}
+
+static int method_session_close(sd_bus_message *m, void *userdata, sd_bus_error *e) {
+        Session *sess = userdata;
+        Manager *mgr = manager_instance;
+        const char *sender = sd_bus_message_get_sender(m);
+
+        if (!sender || !streq(sender, sess->owner))
+                return sd_bus_error_set(e, SD_BUS_ERROR_ACCESS_DENIED,
+                                        "The session does not belong to the caller");
+        session_free(mgr, sess);
         return sd_bus_reply_method_return(m, NULL);
 }
 
@@ -1746,8 +2113,13 @@ static int method_open_session(sd_bus_message *m, void *userdata, sd_bus_error *
         _cleanup_free_ uint8_t *our_pub = NULL;
         uint8_t aes_key[VAULT_DH_KEY_LEN];
         size_t our_pub_len = 0;
+        const char *sender;
         bool dh;
 
+        sender = sd_bus_message_get_sender(m);
+        if (!sender)
+                return sd_bus_error_set(e, SD_BUS_ERROR_ACCESS_DENIED,
+                                        "Cannot determine the D-Bus caller");
         if ((r = sd_bus_message_read(m, "s", &algorithm)) < 0)
                 return r;
         dh = streq(algorithm, "dh-ietf1024-sha256-aes128-cbc-pkcs7");
@@ -1775,6 +2147,12 @@ static int method_open_session(sd_bus_message *m, void *userdata, sd_bus_error *
                 return -ENOMEM;
         sess->path = path;
         path = NULL;   /* owned by the session now */
+        sess->owner = strdup(sender);
+        if (!sess->owner) {
+                free(sess->path);
+                free(sess);
+                return -ENOMEM;
+        }
         if (dh) {
                 sess->encrypted = true;
                 memcpy(sess->aes_key, aes_key, VAULT_DH_KEY_LEN);
@@ -1784,6 +2162,7 @@ static int method_open_session(sd_bus_message *m, void *userdata, sd_bus_error *
                                      "org.freedesktop.Secret.Session", session_vtable, sess);
         if (r < 0) {
                 vault_wipe(sess->aes_key, sizeof sess->aes_key);
+                free(sess->owner);
                 free(sess->path);
                 free(sess);
                 return r;
@@ -1848,6 +2227,10 @@ static int method_create_collection(sd_bus_message *m, void *userdata, sd_bus_er
                                           "org.freedesktop.Secret.Collection", collection_vtable, c)) < 0) {
                 collection_destroy(mgr, c);
                 return r;
+        }
+        if ((r = manager_save()) < 0) {
+                collection_destroy(mgr, c);
+                return persist_error(e, r);
         }
         (void) sd_bus_emit_signal(mgr->bus, SECRETS_PATH, "org.freedesktop.Secret.Service",
                                   "CollectionCreated", "o", c->path);
@@ -1914,8 +2297,34 @@ static void prompt_free(Manager *mgr, Prompt *p) {
         for (Prompt **pp = &mgr->prompts; *pp; pp = &(*pp)->next)
                 if (*pp == p) { *pp = p->next; break; }
         (void) sd_bus_slot_unref(p->slot);
+        free(p->owner);
         free(p->path);
         free(p);
+}
+
+static int on_name_owner_changed(sd_bus_message *m, void *userdata, sd_bus_error *error) {
+        Manager *manager = userdata;
+        const char *name, *old_owner, *new_owner;
+        int r;
+
+        r = sd_bus_message_read(m, "sss", &name, &old_owner, &new_owner);
+        if (r < 0)
+                return r;
+        if (name[0] != ':' || old_owner[0] == '\0' || new_owner[0] != '\0')
+                return 0;
+
+        for (Session *session = manager->sessions, *next; session; session = next) {
+                next = session->next;
+                if (streq(session->owner, name))
+                        session_free(manager, session);
+        }
+        for (Prompt *prompt = manager->prompts, *next; prompt; prompt = next) {
+                next = prompt->next;
+                if (streq(prompt->owner, name))
+                        prompt_free(manager, prompt);
+        }
+
+        return 0;
 }
 
 /* Completed(dismissed, variant<ao> result) — result is the unlocked objects. */
@@ -1939,12 +2348,17 @@ static void prompt_complete(Manager *mgr, Prompt *p, bool dismissed, const char 
 static int method_prompt_prompt(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         Prompt *p = userdata;
         Manager *mgr = manager_instance;
-        bool ok = polkit_check_fresh(m);
+        const char *sender = sd_bus_message_get_sender(m);
+        bool ok;
         int r;
 
+        if (!sender || !streq(sender, p->owner))
+                return sd_bus_error_set(e, SD_BUS_ERROR_ACCESS_DENIED,
+                                        "The prompt does not belong to the caller");
+        ok = polkit_check_fresh(m);
         if (ok && mgr->manual_locked) {
                 mgr->manual_locked = false;
-                mgr->last_verify = now_mono();
+                mgr->last_verify = now_boottime();
                 emit_locked_changed();
         }
         prompt_complete(mgr, p, !ok, ok ? COLLECTION_PATH : NULL);
@@ -1956,8 +2370,12 @@ static int method_prompt_prompt(sd_bus_message *m, void *userdata, sd_bus_error 
 static int method_prompt_dismiss(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         Prompt *p = userdata;
         Manager *mgr = manager_instance;
+        const char *sender = sd_bus_message_get_sender(m);
         int r;
 
+        if (!sender || !streq(sender, p->owner))
+                return sd_bus_error_set(e, SD_BUS_ERROR_ACCESS_DENIED,
+                                        "The prompt does not belong to the caller");
         prompt_complete(mgr, p, true, NULL);
         r = sd_bus_reply_method_return(m, NULL);
         prompt_free(mgr, p);
@@ -1982,11 +2400,12 @@ static int method_lock(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         return reply_lockish(m, true, "/");
 }
 
-/* Unlock: refused while the desktop session is locked (the desktop unlock is the
- * only key). While the desktop is unlocked but an explicit Service.Lock is in
- * effect, hand back a Prompt that re-authenticates (polkit) before clearing it. */
+/* Unlock is refused while the desktop session is locked. While the desktop is
+ * unlocked but an explicit Service.Lock is in effect, return a Prompt that
+ * re-authenticates with polkit before clearing it. */
 static int method_unlock(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         Manager *mgr = userdata;
+        const char *sender = sd_bus_message_get_sender(m);
 
         if (mgr->desktop_locked)
                 return reply_lockish(m, false, "/");   /* refused, no prompt */
@@ -2002,16 +2421,32 @@ static int method_unlock(sd_bus_message *m, void *userdata, sd_bus_error *e) {
                         return -ENOMEM;
                 p->path = ppath;
                 ppath = NULL;
+                if (!sender) {
+                        free(p->path);
+                        free(p);
+                        return sd_bus_error_set(e, SD_BUS_ERROR_ACCESS_DENIED,
+                                                "Cannot determine the D-Bus caller");
+                }
+                p->owner = strdup(sender);
+                if (!p->owner) {
+                        free(p->path);
+                        free(p);
+                        return -ENOMEM;
+                }
                 r = sd_bus_add_object_vtable(mgr->bus, &p->slot, p->path,
                                              "org.freedesktop.Secret.Prompt", prompt_vtable, p);
                 if (r < 0) {
+                        free(p->owner);
                         free(p->path);
                         free(p);
                         return r;
                 }
                 p->next = mgr->prompts;
                 mgr->prompts = p;
-                return reply_lockish(m, false, p->path);   /* unlocked=[], prompt=path */
+                r = reply_lockish(m, false, p->path);   /* unlocked=[], prompt=path */
+                if (r < 0)
+                        prompt_free(mgr, p);
+                return r;
         }
         return reply_lockish(m, true, "/");   /* already unlocked */
 }
@@ -2022,6 +2457,7 @@ static int method_get_secrets(sd_bus_message *m, void *userdata, sd_bus_error *e
         _cleanup_free_ char **paths = NULL;
         size_t n = 0;
         const char *session;
+        Session *sess;
         int r;
 
         if (collection_locked(mgr)) {   /* locked → release nothing */
@@ -2055,6 +2491,8 @@ static int method_get_secrets(sd_bus_message *m, void *userdata, sd_bus_error *e
                 return r;
         if ((r = sd_bus_message_read(m, "o", &session)) < 0)
                 return r;
+        if (!(sess = message_session(m, session, e)))
+                return -EACCES;
 
         if ((r = sd_bus_message_new_method_return(m, &reply)) < 0)
                 return r;
@@ -2068,7 +2506,7 @@ static int method_get_secrets(sd_bus_message *m, void *userdata, sd_bus_error *e
                         return r;
                 if ((r = sd_bus_message_append(reply, "o", it->path)) < 0)
                         return r;
-                if ((r = append_secret(reply, session, it->secret, it->secret_len, it->content_type)) < 0)
+                if ((r = append_secret(reply, sess, it->secret, it->secret_len, it->content_type)) < 0)
                         return r;
                 if ((r = sd_bus_message_close_container(reply)) < 0)
                         return r;
@@ -2169,8 +2607,6 @@ static void resolve_my_session(Manager *mgr) {
                                         "org.freedesktop.login1.Session", "LockedHint", NULL, 'b', &locked) >= 0) {
                 bool was = collection_locked(mgr);
                 mgr->desktop_locked = locked;
-                if (!locked)
-                        mgr->last_verify = now_mono();
                 if (was != collection_locked(mgr))
                         emit_locked_changed();
         }
@@ -2199,7 +2635,6 @@ static int on_session_unlock(sd_bus_message *m, void *userdata, sd_bus_error *e)
         if (!is_my_session(mgr, m))
                 return 0;
         mgr->desktop_locked = false;
-        mgr->last_verify = now_mono();           /* the screen unlock is the auth */
         if (was != collection_locked(mgr))
                 emit_locked_changed();
         return 0;
@@ -2226,8 +2661,6 @@ static int on_session_props(sd_bus_message *m, void *userdata, sd_bus_error *e) 
                                 if ((bool) locked != mgr->desktop_locked) {
                                         bool was = collection_locked(mgr);
                                         mgr->desktop_locked = locked;
-                                        if (!locked)
-                                                mgr->last_verify = now_mono();
                                         if (was != collection_locked(mgr))
                                                 emit_locked_changed();
                                 }
@@ -2237,6 +2670,19 @@ static int on_session_props(sd_bus_message *m, void *userdata, sd_bus_error *e) 
                 (void) sd_bus_message_exit_container(m);
         }
         (void) sd_bus_message_exit_container(m);
+        return 0;
+}
+
+static int on_prepare_for_sleep(sd_bus_message *m, void *userdata, sd_bus_error *error) {
+        Manager *manager = userdata;
+        int preparing;
+        int r;
+
+        r = sd_bus_message_read(m, "b", &preparing);
+        if (r < 0)
+                return r;
+        if (preparing)
+                manager->last_verify = 0;
         return 0;
 }
 
@@ -2259,6 +2705,9 @@ static void setup_logind_lock(Manager *mgr, sd_event *event) {
                                    "org.freedesktop.login1.Manager", "SessionNew", on_sessions_changed, mgr);
         (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
                                    "org.freedesktop.login1.Manager", "SessionRemoved", on_sessions_changed, mgr);
+        (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
+                                   "org.freedesktop.login1.Manager", "PrepareForSleep",
+                                   on_prepare_for_sleep, mgr);
 
         resolve_my_session(mgr);
         sd_journal_print(LOG_INFO, "tracking logind lock state (session %s, initial state: %s)",
@@ -2419,7 +2868,6 @@ int main(void) {
 
         manager.bus = bus;
         manager.coll_created = now_secs();
-        manager.last_verify = now_mono();   /* the user is present at startup */
         const char *fw = getenv("SECRETD_FRESH_WINDOW_SEC");
         if (fw && *fw)
                 g_fresh_window = strtoull(fw, NULL, 10);
@@ -2456,6 +2904,10 @@ int main(void) {
 
         if ((r = sd_bus_attach_event(bus, event, SD_EVENT_PRIORITY_NORMAL)) < 0)
                 return fail("attach bus to event loop", r);
+        if ((r = sd_bus_match_signal(bus, NULL, "org.freedesktop.DBus",
+                                     "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                     "NameOwnerChanged", on_name_owner_changed, &manager)) < 0)
+                return fail("track D-Bus client lifetime", r);
 
         setup_logind_lock(&manager, event);   /* tie lock state to the desktop session */
         (void) setup_varlink(&manager, event); /* io.platformd.Secret admin interface */

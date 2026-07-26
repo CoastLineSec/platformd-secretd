@@ -19,8 +19,12 @@ secretd = executable(
 
 # --- tests (meson test) ---
 test('vault', executable('test-vault', 'test-vault.c', 'vault.c', dependencies : libcrypto))
+security_test = executable('test-security', 'test-security.c', dependencies : libsystemd)
 test('integration', find_program('sh'),
      args : [meson.current_source_dir() / 'test-integration.sh', secretd],
+     timeout : 60)
+test('security', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-security.sh', secretd, security_test],
      timeout : 60)
 test('malformed-store', find_program('sh'),
      args : [meson.current_source_dir() / 'test-malformed-store.sh', secretd],

@@ -77,7 +77,7 @@ Object: `/org/freedesktop/secrets`.
 | --- | --- | --- |
 | `OpenSession` | `(sv) → (vo)` | Negotiates a transport session. Both `plain` and the encrypted `dh-ietf1024-sha256-aes128-cbc-pkcs7` (1024-bit MODP Diffie-Hellman + HKDF-SHA256 → AES-128-CBC/PKCS7, byte-compatible with `libsecret`) are implemented; unknown algorithms return `org.freedesktop.DBus.Error.NotSupported`, and `libsecret` falls back to `plain`. |
 | `SearchItems` | `(a{ss}) → (ao ao)` | Returns matching item paths split into `unlocked` and `locked`. An item matches when every requested attribute is present with an equal value. |
-| `GetSecrets` | `(ao o) → (a{o(oayays)})` | Returns the secrets for several items in one call, keyed by item path. |
+| `GetSecrets` | `(ao o) → (a{o(oayays)})` | Returns the secrets for several items in one call, keyed by item path. The transport session must belong to the calling D-Bus connection. |
 | `ReadAlias` | `(s) → (o)` | Resolves an alias name; `default` returns the default collection, anything else returns `/`. |
 | `Unlock` / `Lock` | `(ao) → (ao o)` | Trust transitions (see [Trust model](#trust-model)). `Lock` marks the collection locked; `Unlock` releases it **only while the desktop session is unlocked** — while the screen is locked, `Unlock` is refused. Clearing an explicit `Lock` returns a `Prompt` that re-authenticates via polkit. |
 | `CreateCollection` | `(a{sv} s) → (o o)` | Creates a named collection from the `org.freedesktop.Secret.Collection.Label` property (the `default` alias returns the built-in default). Additional collections live alongside the default and are persisted. |
@@ -117,7 +117,8 @@ verbatim. With the DH transport `value` is AES-128-CBC ciphertext and
 ### org.freedesktop.Secret.Session
 
 Objects: `/org/freedesktop/secrets/session/N`. Provides `Close()`. One session is
-created per `OpenSession`.
+created per `OpenSession`, is usable only by that D-Bus connection, and is
+removed when its owner disconnects.
 
 ### org.freedesktop.Secret.Prompt
 
@@ -125,6 +126,8 @@ Objects: `/org/freedesktop/secrets/prompt/N`. A `Prompt` is how the service asks
 the user to authorise an operation. `Service.Unlock` returns one when an explicit
 `Service.Lock` is in effect; `Prompt(window-id)` re-authenticates the caller via
 polkit and then emits `Completed(dismissed, result)`, and `Dismiss()` cancels it.
+A prompt is usable only by the connection that requested it and is removed when
+that connection disconnects.
 
 ## secretctl
 
@@ -182,6 +185,12 @@ single **vault key**. Writes are atomic (write-temp-then-rename). The plaintext
 payload and the vault key are wiped from memory with `OPENSSL_cleanse` after use,
 the vault key is held `mlock(2)`-ed, and the unit sets `LimitCORE=0` so secrets
 cannot reach a coredump.
+
+The daemon accepts a mutation only after the complete new store has been
+serialized and written. A serialization, encryption, size-limit, or filesystem
+error rolls the in-memory mutation back and is returned on D-Bus. If an existing
+store cannot be read or parsed completely, the daemon serves no partially loaded
+objects and rejects mutations so the unreadable file cannot be replaced.
 
 ### The vault key
 
@@ -277,8 +286,8 @@ honestly observed: a logind session that is active (*observed*) and unlocked
 over Varlink (`io.platformd.Trust.EvaluatePolicy`, `local-trusted-session`); the
 `TrustGate` indirection keeps that behind one interface, without changing the
 storage, the D-Bus surface, or the item policies. `Lock`/`Unlock` map onto the
-session model: unlocking records a verification event; locking marks items
-unavailable and clears cached plaintext.
+session model, but logind lock-state transitions do not count as explicit
+verification events.
 
 **Enforcement (as implemented).** The gate is `trust_gate()`, evaluated in
 `Item.GetSecret`. Effective lock state is the OR of two sources: the logind
@@ -286,12 +295,15 @@ session lock (`desktop_locked`, driven by the `login1` session `Lock`/`Unlock`
 signals and `LockedHint`) and an explicit `Service.Lock` (`manual_locked`).
 Crucially, **`Service.Unlock` refuses while `desktop_locked`** — a client cannot
 release secrets while the screen is locked; the only key is unlocking the
-session itself, which takes real authentication. Items opt into stronger gating
-with attributes: `platformd.policy=fresh-verification` (released only within a
-freshness window of a genuine desktop unlock), `platformd.policy=trusted-platform`
+session itself. Items opt into stronger gating with attributes:
+`platformd.policy=fresh-verification` (released only within a freshness window
+of an explicit successful verification), `platformd.policy=trusted-platform`
 (gated on `platformd-trustd`'s `local-trusted-session` verdict), and
-`platformd.min-grade` (a caller-grade floor). A stale `fresh-verification` read
-triggers an interactive
+`platformd.min-grade` (a caller-grade floor). Unsupported or duplicate policy
+attributes are rejected, and unrecognized values already present in a store
+deny release. A zero freshness window disables cached freshness. Freshness uses
+`CLOCK_BOOTTIME`, is empty at daemon startup, and is invalidated when suspend
+begins. A stale `fresh-verification` read triggers an interactive
 **polkit** check (`io.platformd.secret1.verify-fresh`, `auth_self`): the desktop
 agent prompts the user, and only a real authentication refreshes the freshness
 and releases the item. A stale `trusted-platform` read instead steps up through
@@ -322,22 +334,19 @@ per-item `GetSecret`.
 Authenticating the user is not enough; the provider must also identify the
 **caller**, which on Linux is the hard part. Caller identity is therefore treated
 as graded evidence, never as a binary, and UID alone is never taken as sufficient
-for high-value release. Evidence is gathered from D-Bus peer credentials and
-`sd-login` (UID, PID, control group, systemd unit, and, where present, a Flatpak
-or XDG-portal application identifier and an LSM label) and graded:
+for high-value release. The current implementation records D-Bus peer
+credentials, but grants only the grade it can verify:
 
 ```
 unknown        not enough evidence
 same-user-weak ordinary unsandboxed process under our UID
-systemd-unit   belongs to a named systemd unit
-dbus-subject   D-Bus peer credentials known
-sandboxed-app  Flatpak / portal application identifier available
-signed-app     future; requires a package/signature policy
 ```
 
-The provider records and reports this grade for every request. Where isolation is
-weak (`same-user-weak`), it does not pretend the identity is strong; it releases
-only what the item policy permits at that grade.
+The `systemd-unit` and `sandboxed-app` policy values are reserved, but are not
+granted from unit or cgroup names because those names are not authenticated
+application identities. Items requiring either grade remain unavailable until a
+verifiable identity source is implemented. The provider records the caller UID,
+PID, user unit, and resulting grade for each read or protected mutation.
 
 ## Security considerations
 
@@ -347,9 +356,13 @@ Stated honestly, by what the implementation addresses and what it does not.
 
 - A same-user process reading high-value secrets without a recent verification —
   bounded by the `fresh-verification` item policy and the trust gate.
-- Secrets at rest on a powered-off or stolen disk — addressed by encryption with a
-  passphrase-derived (later TPM-bound) vault key.
-- A locked session — `Lock` makes items unavailable and clears cached plaintext.
+- Secrets at rest when a vault key is supplied as a systemd credential —
+  addressed by AES-256-GCM storage encryption.
+- A locked session — `Lock` makes items unavailable.
+- Cross-client transport-session and prompt use — these objects are tied to
+  their creating D-Bus connection and removed at disconnect.
+- Store write errors — a mutation is rolled back and its D-Bus call fails rather
+  than reporting an in-memory-only success.
 
 **Not addressed (degraded or unsupported, not hidden).**
 
@@ -399,14 +412,14 @@ sealing through systemd.
 
 ## Status
 
-Functional and feature-complete for the freedesktop.org Secret Service API: the
-Service, collections (the default plus additional named ones), items, sessions,
-and prompts, interoperable with libsecret and `secret-tool`. Secrets are encrypted
-in transit (the DH session transport) and at rest (AES-256-GCM). The trust gate is
-enforced — the logind session lock, graded caller identity, and the
-`fresh-verification` and `trusted-platform` item policies; the latter consumes
-`platformd-trustd`'s verdict and steps up through `platformd-verifyd`. `secretctl`
-and the `io.platformd.Secret` Varlink interface round it out.
+The implemented Secret Service surface includes the Service, default and named
+collections, items, client-owned sessions, and client-owned prompts, with
+libsecret and `secret-tool` integration. The DH transport encrypts secrets in
+transit; AES-256-GCM storage encryption is enabled when a vault-key credential is
+configured. The gate enforces the logind lock state, explicit verification
+freshness, the currently verifiable caller grade, and the `trusted-platform`
+policy. `secretctl` and the read-only `io.platformd.Secret` Varlink interface
+provide inspection and management.
 
 A TPM-bound vault key (via `systemd-cryptenroll`) remains future work; today the
 vault key is delivered as a systemd credential, or the store rides on an
