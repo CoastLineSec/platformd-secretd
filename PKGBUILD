@@ -5,7 +5,7 @@
 # once the tree is configured.)
 
 pkgname=platformd-secretd
-pkgver=0.0.1
+pkgver=0.1.3
 pkgrel=1
 pkgdesc='Platform-authentication-aware Secret Service provider (org.freedesktop.secrets)'
 arch=('x86_64')
