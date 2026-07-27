@@ -26,9 +26,18 @@ PID=$!
 trap 'kill "$PID" 2>/dev/null || true; rm -rf "$XDG_DATA_HOME"' EXIT INT TERM
 
 i=0
-while [ "$i" -lt 300 ]; do
-        busctl --user status org.freedesktop.secrets >/dev/null 2>&1 && break
+while ! busctl --user status org.freedesktop.secrets >/dev/null 2>&1; do
+        if ! kill -0 "$PID" 2>/dev/null; then
+                wait "$PID" || rc=$?
+                echo "FAIL: platformd-secretd exited before claiming its bus name (status ${rc:-0})"
+                exit 1
+        fi
+        if [ "$i" -ge 500 ]; then
+                echo "FAIL: platformd-secretd did not claim its bus name"
+                exit 1
+        fi
         i=$((i + 1))
+        sleep 0.01
 done
 
 printf 's3cr3t-int' | secret-tool store --label='integration' svc inttest
