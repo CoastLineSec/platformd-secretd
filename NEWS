@@ -1,6 +1,28 @@
 platformd-secretd NEWS
 ======================
 
+platformd-secretd 0.1.3
+
+  * Freshness is established only by an explicit successful verification.
+    Startup, session discovery, and observed logind unlock state no longer
+    create verification freshness. Freshness uses CLOCK_BOOTTIME and is
+    invalidated before suspend.
+  * The platformd.policy and platformd.min-grade item attributes are validated
+    when created or changed, and unknown values fail closed when evaluated.
+    Configuring a zero freshness window disables cached freshness instead of
+    allowing unconditional release.
+  * Persistent mutations now report success only after the complete store has
+    been serialized and written. A failed write rolls the in-memory mutation
+    back. Malformed stores are rejected as a whole, empty collections are
+    persisted, and the store size limit is enforced before writing.
+  * Secret Service sessions and prompts are bound to the D-Bus connection that
+    created them. Cross-client operations are rejected, and client disconnect
+    removes the associated objects and transport keys.
+  * Caller placement and user-unit names no longer grant stronger identity
+    grades. The current implementation grants only same-user-weak; the
+    systemd-unit and sandboxed-app grades remain unavailable until backed by a
+    verifiable identity source.
+
 platformd-secretd 0.1.2
 
   Audit hardening:
