@@ -4,31 +4,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/*
- * vault — the cryptographic primitives for platformd-secretd's encrypted store.
- *
- * AES-256-GCM provides confidentiality and integrity for item records and for
- * wrapped per-item keys; Argon2id derives the vault key from a passphrase. The
- * storage-layer key hierarchy (per-item keys wrapped by the vault key) is built
- * on top of these primitives. See docs/secret-service.md, "Storage model".
- */
+/* Cryptographic primitives for storage and Secret Service transport. */
 
-#define VAULT_KEY_LEN   32u   /* 256-bit keys: the vault key and per-item keys */
+#define VAULT_KEY_LEN   32u   /* AES-256-GCM vault key */
 #define VAULT_NONCE_LEN 12u   /* 96-bit AES-GCM nonce */
 #define VAULT_TAG_LEN   16u   /* 128-bit AES-GCM authentication tag */
-#define VAULT_SALT_LEN  16u   /* Argon2id salt */
 
 /* Fill buf with cryptographically secure random bytes. 0 on success, -EIO on failure. */
 int vault_random(void *buf, size_t len);
 
 /* Wipe sensitive memory in place (does not free). */
 void vault_wipe(void *buf, size_t len);
-
-/* Derive a vault key from a passphrase with Argon2id and the given salt.
- * Returns 0 on success, or a negative errno-style code. */
-int vault_derive_key(const char *passphrase,
-                     const uint8_t salt[VAULT_SALT_LEN],
-                     uint8_t key_out[VAULT_KEY_LEN]);
 
 /* AES-256-GCM seal: generate a fresh nonce, encrypt pt_len bytes of pt into
  * ct_out (which must hold pt_len bytes), and write the authentication tag.
@@ -55,7 +41,7 @@ int vault_open(const uint8_t key[VAULT_KEY_LEN],
 
 /* 1024-bit MODP DH (RFC 2409 group 2, g=2) + HKDF-SHA256, matching libsecret /
  * gnome-keyring. Given the peer's public key, generate our keypair; output our
- * public key (malloc'd — caller frees) and the derived AES-128 transport key.
+ * public key, owned by the caller, and the derived AES-128 transport key.
  * Returns 0, or a negative errno-style code. */
 int vault_dh_transport(const uint8_t *peer_pub, size_t peer_len,
                        uint8_t **our_pub, size_t *our_pub_len,

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
-/* Unit tests for the vault crypto primitives (Argon2id + AES-256-GCM). */
+/* Unit tests for storage and Secret Service transport primitives. */
 
 #include "vault.h"
 
@@ -21,43 +21,25 @@ static int failures;
         } while (0)
 
 int main(void) {
-        uint8_t salt[VAULT_SALT_LEN], salt2[VAULT_SALT_LEN];
-        uint8_t k1[VAULT_KEY_LEN], k2[VAULT_KEY_LEN], k3[VAULT_KEY_LEN];
+        uint8_t key[VAULT_KEY_LEN], wrong_key[VAULT_KEY_LEN];
         uint8_t ct[64], nonce[VAULT_NONCE_LEN], tag[VAULT_TAG_LEN], pt[64];
         const char *msg = "s3cr3t-value-42";
         size_t mlen = strlen(msg);
         int r;
 
-        /* Argon2id: deterministic per (passphrase, salt), salt-sensitive. */
-        memcpy(salt,  "0123456789abcdef", VAULT_SALT_LEN);
-        memcpy(salt2, "fedcba9876543210", VAULT_SALT_LEN);
-        r = vault_derive_key("correct horse battery staple", salt, k1);
-        CHECK(r == 0, "derive_key succeeds");
-        vault_derive_key("correct horse battery staple", salt, k2);
-        vault_derive_key("correct horse battery staple", salt2, k3);
-        CHECK(memcmp(k1, k2, VAULT_KEY_LEN) == 0, "same passphrase+salt -> same key");
-        CHECK(memcmp(k1, k3, VAULT_KEY_LEN) != 0, "different salt -> different key");
+        CHECK(vault_random(key, sizeof key) == 0, "vault key generation succeeds");
+        CHECK(vault_random(wrong_key, sizeof wrong_key) == 0, "second key generation succeeds");
 
-        /* AES-256-GCM round-trip. */
-        r = vault_seal(k1, (const uint8_t *) msg, mlen, nonce, ct, tag);
+        r = vault_seal(key, (const uint8_t *) msg, mlen, nonce, ct, tag);
         CHECK(r == 0, "seal succeeds");
         CHECK(memcmp(ct, msg, mlen) != 0, "ciphertext differs from plaintext");
-        r = vault_open(k1, nonce, ct, mlen, tag, pt);
+        r = vault_open(key, nonce, ct, mlen, tag, pt);
         CHECK(r == 0 && memcmp(pt, msg, mlen) == 0, "open recovers the plaintext");
 
-        /* Integrity: reject tampering and the wrong key. */
         ct[0] ^= 0x01;
-        CHECK(vault_open(k1, nonce, ct, mlen, tag, pt) == -EBADMSG, "tampered ciphertext rejected");
+        CHECK(vault_open(key, nonce, ct, mlen, tag, pt) == -EBADMSG, "tampered ciphertext rejected");
         ct[0] ^= 0x01;
-        CHECK(vault_open(k3, nonce, ct, mlen, tag, pt) != 0, "wrong key rejected");
-
-        /* Per-item key wrap/unwrap (the storage key hierarchy). */
-        uint8_t ik[VAULT_KEY_LEN], wrapped[VAULT_KEY_LEN],
-                wn[VAULT_NONCE_LEN], wt[VAULT_TAG_LEN], uk[VAULT_KEY_LEN];
-        CHECK(vault_random(ik, VAULT_KEY_LEN) == 0, "vault_random succeeds");
-        r  = vault_seal(k1, ik, VAULT_KEY_LEN, wn, wrapped, wt);
-        r |= vault_open(k1, wn, wrapped, VAULT_KEY_LEN, wt, uk);
-        CHECK(r == 0 && memcmp(ik, uk, VAULT_KEY_LEN) == 0, "per-item key wrap/unwrap round-trips");
+        CHECK(vault_open(wrong_key, nonce, ct, mlen, tag, pt) != 0, "wrong key rejected");
 
         /* DH session transport: AES-128-CBC round-trip. */
         uint8_t tkey[VAULT_DH_KEY_LEN], tiv[VAULT_DH_IV_LEN], *tct = NULL, *tpt = NULL;

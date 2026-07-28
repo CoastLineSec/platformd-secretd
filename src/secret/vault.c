@@ -21,40 +21,6 @@ void vault_wipe(void *buf, size_t len) {
         OPENSSL_cleanse(buf, len);
 }
 
-int vault_derive_key(const char *passphrase,
-                     const uint8_t salt[VAULT_SALT_LEN],
-                     uint8_t key_out[VAULT_KEY_LEN]) {
-        EVP_KDF *kdf;
-        EVP_KDF_CTX *ctx;
-        int r;
-
-        /* Argon2id parameters: 64 MiB memory, 3 passes, single lane. */
-        uint32_t memcost = 65536, iter = 3, lanes = 1, threads = 1;
-
-        kdf = EVP_KDF_fetch(NULL, "ARGON2ID", NULL);
-        if (!kdf)
-                return -ENOTSUP;
-        ctx = EVP_KDF_CTX_new(kdf);
-        EVP_KDF_free(kdf);
-        if (!ctx)
-                return -ENOMEM;
-
-        OSSL_PARAM params[7], *p = params;
-        *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_PASSWORD,
-                                                 (void *) passphrase, strlen(passphrase));
-        *p++ = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT,
-                                                 (void *) salt, VAULT_SALT_LEN);
-        *p++ = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_MEMCOST, &memcost);
-        *p++ = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ITER, &iter);
-        *p++ = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_LANES, &lanes);
-        *p++ = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_THREADS, &threads);
-        *p = OSSL_PARAM_construct_end();
-
-        r = EVP_KDF_derive(ctx, key_out, VAULT_KEY_LEN, params) == 1 ? 0 : -EIO;
-        EVP_KDF_CTX_free(ctx);
-        return r;
-}
-
 int vault_seal(const uint8_t key[VAULT_KEY_LEN],
                const uint8_t *pt, size_t pt_len,
                uint8_t nonce_out[VAULT_NONCE_LEN],
@@ -118,7 +84,7 @@ out:
 
 /* --- Secret Service DH session transport ------------------------------------ */
 
-/* HKDF-SHA256(ikm) with a zero salt and empty info (RFC 5869) — the derivation
+/* HKDF-SHA256(ikm) with a zero salt and empty info (RFC 5869). The derivation
  * libsecret / gnome-keyring use for the DH transport. */
 static int hkdf_sha256(const uint8_t *ikm, size_t ikm_len, uint8_t *out, size_t out_len) {
         static const uint8_t zero_salt[32] = {0};
@@ -176,7 +142,7 @@ int vault_dh_transport(const uint8_t *peer_pub, size_t peer_len,
         sz = DH_size(dh);
         if (!peer || sz <= 0 || !(shared = malloc((size_t) sz)))
                 goto out;
-        /* Minimal big-endian, leading zeros stripped — matches gcrypt USG. */
+        /* Minimal big-endian with leading zeros stripped, matching gcrypt USG. */
         slen = DH_compute_key(shared, peer, dh);
         if (slen < 0 || hkdf_sha256(shared, (size_t) slen, key_out, VAULT_DH_KEY_LEN) < 0)
                 goto out;

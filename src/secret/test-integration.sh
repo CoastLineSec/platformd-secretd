@@ -53,7 +53,7 @@ fi
 # --- A1: protected mutation is gated ----------------------------------------
 # Store an item that requires the trusted-platform verdict. With no
 # platformd-trustd reachable here, that verdict is not satisfied, so the item's
-# secret must not be released — and, the point of this check, its protected state
+# secret must not be released. Its protected state
 # must not be mutable either (SetAttributes could otherwise strip the policy and
 # unlock a read). Point both the trust and verify sockets at dead paths so the
 # verdict is denied and the step-up fails fast without a real reader prompt.

@@ -1,11 +1,6 @@
-# Man pages, authored in DocBook XML and rendered with xsltproc against the
-# DocBook manpages stylesheet — the same toolchain systemd uses. Requires
-# docbook-xsl (the stylesheet) and xsltproc; skipped if xsltproc is absent.
-
 xsltproc = find_program('xsltproc', required : false)
 
 if xsltproc.found()
-        # [stem, manvolnum, [alias pages generated from extra <refname>s]]
         manpages = [
                 ['secretctl', '1', []],
                 ['platformd-secretd.service', '8', ['platformd-secretd.8']],

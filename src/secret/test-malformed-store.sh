@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # Parser robustness ("fuzz-lite"): feed truncated, bit-flipped, and hostile
-# on-disk store files to platformd-secretd and confirm it never crashes — it
+# on-disk store files to platformd-secretd and confirm it never crashes; it
 # must reject a malformed store and still come up with writes disabled. Most
 # valuable against an ASan/UBSan build, where a parser memory bug aborts the
 # process and is caught here. Isolated on a private bus. Skips (77) without tools.

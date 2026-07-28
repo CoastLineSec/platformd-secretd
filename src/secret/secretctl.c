@@ -1,18 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
-/*
- * secretctl — inspect and manage the platformd Secret Service.
- *
- * Companion CLI for platformd-secretd, in the grammar of homectl / loginctl:
- * a per-daemon tool, not an umbrella. Verbs:
- *
- *   status   provider ownership + logind session/lock + caller-identity probe
- *   list     the default collection's items and their attributes
- *   lock     lock the default collection
- *   unlock   unlock the default collection
- *
- * Day-to-day secret access stays with secret-tool(1); lifecycle with systemctl.
- * See docs/secret-service.md.
- */
+/* Command-line client for platformd-secretd. */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -24,17 +11,17 @@
 #include <systemd/sd-bus.h>
 #include <systemd/sd-login.h>
 
-#define PROGRAM_VERSION "0.0.1"
+#ifndef PROGRAM_VERSION
+#define PROGRAM_VERSION "unknown"
+#endif
 #define streq(a, b) (strcmp((a), (b)) == 0)
 
-/* systemd-style scope-based cleanup. sd-bus.h already provides the sd_bus and
- * sd_bus_message cleanup helpers via _SD_DEFINE_POINTER_CLEANUP_FUNC; we only
- * add freep for plain heap strings (mirrors systemd's src/basic/ freep). */
+/* sd-bus.h provides cleanup helpers for bus and message objects. */
 #define _cleanup_(f) __attribute__((cleanup(f)))
 static inline void freep(void *p) { free(*(void **) p); }
 #define _cleanup_free_ _cleanup_(freep)
 
-/* Probe 1 — who, if anyone, provides org.freedesktop.secrets on the session bus. */
+/* Report the owner of org.freedesktop.secrets on the user bus. */
 static void probe_secret_service(void) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -59,7 +46,7 @@ static void probe_secret_service(void) {
                 return;
         }
         if (sd_bus_message_read(m1, "b", &has_owner) < 0 || !has_owner) {
-                printf("  provider:  none — org.freedesktop.secrets is unclaimed\n");
+                printf("  provider:  none, org.freedesktop.secrets is unclaimed\n");
                 printf("             (no Secret Service provider is running on this session)\n");
                 return;
         }
@@ -78,7 +65,7 @@ static void probe_secret_service(void) {
         if (pid > 0)
                 (void) sd_pid_get_user_unit(pid, &unit);
 
-        printf("  provider:  claimed — owner %s", owner ? owner : "?");
+        printf("  provider:  claimed, owner %s", owner ? owner : "?");
         if (pid > 0)
                 printf(", pid %u", (unsigned) pid);
         if (unit)
@@ -87,7 +74,7 @@ static void probe_secret_service(void) {
 }
 
 /* logind's declared lock state for a session (login1 LockedHint property).
- * It is a *declared* hint, not verified — see the claim vocabulary. Returns
+ * It is a declared hint, not verified. Returns
  * 1 locked, 0 unlocked, <0 unknown. */
 static int session_locked_hint(const char *session) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -111,14 +98,14 @@ static int session_locked_hint(const char *session) {
         return locked;
 }
 
-/* Probe 2 — the logind session this process belongs to (session/lock/seat). */
+/* Report the logind session that contains this process. */
 static void probe_session(void) {
         _cleanup_free_ char *session = NULL, *seat = NULL, *type = NULL,
                             *class = NULL, *state = NULL;
         int active, locked;
 
         if (sd_pid_get_session(0, &session) < 0) {
-                printf("  session:   none — this process is not in a logind session\n");
+                printf("  session:   none, this process is not in a logind session\n");
                 return;
         }
         (void) sd_session_get_seat(session, &seat);
@@ -136,7 +123,7 @@ static void probe_session(void) {
                locked < 0 ? "unknown" : (locked ? "yes (declared)" : "no (declared)"));
 }
 
-/* Probe 3 — this process's own caller identity, graded as evidence. */
+/* Report the identity evidence available for this process. */
 static void probe_caller_identity(void) {
         _cleanup_free_ char *unit = NULL, *cgroup = NULL;
         const char *quality;
@@ -145,7 +132,7 @@ static void probe_caller_identity(void) {
                 (void) sd_pid_get_unit(0, &unit);
         (void) sd_pid_get_cgroup(0, &cgroup);
 
-        quality = unit ? "systemd-unit" : "same-user-weak";
+        quality = "same-user-weak";
 
         printf("  caller:    uid=%u pid=%u unit=%s\n",
                (unsigned) getuid(), (unsigned) getpid(), unit ? unit : "-");
@@ -211,7 +198,7 @@ static int cmd_list(void) {
                 if (r <= 0)
                         break;
                 (void) sd_bus_get_property_string(bus, SECRETS_NAME, ip, IF_ITEM, "Label", NULL, &label);
-                printf("  • %s\n", (label && *label) ? label : "(no label)");
+                printf("  * %s\n", (label && *label) ? label : "(no label)");
                 if (sd_bus_get_property(bus, SECRETS_NAME, ip, IF_ITEM, "Attributes", NULL, &attrs, "a{ss}") >= 0 &&
                     sd_bus_message_enter_container(attrs, 'a', "{ss}") >= 0) {
                         while (sd_bus_message_enter_container(attrs, 'e', "ss") > 0) {
@@ -286,9 +273,13 @@ static int lock_or_unlock(const char *method) {
                         fprintf(stderr, "secretctl: %s\n", error.message ? error.message : "prompt failed");
                         return EXIT_FAILURE;
                 }
-                for (int i = 0; !w.done && i < 200; i++)
+                for (int i = 0; !w.done && i < 2600; i++)
                         if (sd_bus_process(bus, NULL) <= 0)
                                 (void) sd_bus_wait(bus, 50000);
+                if (!w.done) {
+                        fprintf(stderr, "secretctl: unlock prompt timed out\n");
+                        return EXIT_FAILURE;
+                }
                 if (w.dismissed) {
                         fprintf(stderr, "secretctl: unlock declined\n");
                         return EXIT_FAILURE;
@@ -304,7 +295,7 @@ static int cmd_lock(void)   { return lock_or_unlock("Lock"); }
 static int cmd_unlock(void) { return lock_or_unlock("Unlock"); }
 
 static int cmd_status(void) {
-        printf("secretctl status — read-only; nothing is claimed, nothing is stored\n\n");
+        printf("secretctl status: read-only; nothing is claimed or stored\n\n");
         probe_secret_service();
         probe_session();
         probe_caller_identity();
@@ -312,7 +303,7 @@ static int cmd_status(void) {
 }
 
 static int help(void) {
-        printf("secretctl %s — Secret Service inspector (read-only)\n\n", PROGRAM_VERSION);
+        printf("secretctl %s\n\n", PROGRAM_VERSION);
         printf("Usage:\n");
         printf("  secretctl status     Report the provider, session/lock state, and caller identity\n");
         printf("  secretctl list       List the default collection's items and attributes\n");

@@ -39,7 +39,7 @@ platformd-secretd 0.1.2
     daemon for other clients.
   * An encrypted store that cannot be opened (no key, wrong key, or a newer /
     foreign on-disk version) disables writes instead of overwriting it with an
-    empty store — one misconfigured boot no longer destroys the secrets. The unit
+    empty store, so one misconfigured boot no longer destroys the secrets. The unit
     STATUS reflects encrypted / plaintext / read-only.
   * logind lock tracking rebinds when the session changes (log out / in), rather
     than binding once at startup and going deaf.
@@ -48,7 +48,8 @@ platformd-secretd 0.1.1
 
   * Trusted-platform items step up through platformd-verifyd: a stale
     platformd.policy=trusted-platform read re-verifies presence (fingerprint,
-    face, …) and refreshes platformd-trustd, releasing only if the platform is
+    face, or another configured PAM method) and refreshes platformd-trustd,
+    releasing only if the platform is
     then trusted. Documentation brought in line with the platformd-trustd gate.
 
 platformd-secretd 0.1.0
@@ -99,6 +100,3 @@ platformd-secretd 0.1.0
   Tests (meson test): vault (crypto primitives), integration (isolated D-Bus
   store/lookup round-trip), and malformed-store (parser robustness against
   truncated / bit-flipped / hostile store files). Green under ASan/UBSan.
-
-  Versioning: the 0.x series is pre-release. The 1.0 tag is gated on an
-  independent security review.
