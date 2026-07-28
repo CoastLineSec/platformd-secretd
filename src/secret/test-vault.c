@@ -53,13 +53,32 @@ int main(void) {
               "transport decrypt recovers the plaintext");
         free(tct); free(tpt);
 
-        /* DH agreement runs and yields a key + a public value. */
-        uint8_t peer[128], *spub = NULL, dhkey[VAULT_DH_KEY_LEN];
+        /* DH shared secrets are padded to the group size before HKDF. */
+        static const uint8_t expected_dhkey[VAULT_DH_KEY_LEN] = {
+                0xb5, 0x13, 0x73, 0x72, 0x29, 0x62, 0xab, 0x41,
+                0x21, 0x16, 0xd6, 0x1a, 0xd7, 0x5a, 0x82, 0x21,
+        };
+        uint8_t peer[] = { 4 }, private_key[] = { 2 };
+        uint8_t *spub = NULL, dhkey[VAULT_DH_KEY_LEN];
         size_t spublen = 0;
-        vault_random(peer, sizeof peer);
-        r = vault_dh_transport(peer, sizeof peer, &spub, &spublen, dhkey);
-        CHECK(r == 0 && spub && spublen > 0 && spublen <= 128, "dh_transport yields a key + public value");
+
+        r = vault_dh_transport_for_test(
+                        peer, sizeof peer,
+                        private_key, sizeof private_key,
+                        &spub, &spublen, dhkey);
+        CHECK(r == 0 && spub && spublen == 1 && spub[0] == 4,
+              "DH transport yields the expected public value");
+        CHECK(r == 0 && memcmp(dhkey, expected_dhkey, sizeof dhkey) == 0,
+              "DH transport preserves leading zero bytes before HKDF");
         free(spub);
+
+        peer[0] = 1;
+        spub = NULL;
+        r = vault_dh_transport_for_test(
+                        peer, sizeof peer,
+                        private_key, sizeof private_key,
+                        &spub, &spublen, dhkey);
+        CHECK(r == -EINVAL && !spub, "DH transport rejects an invalid peer key");
 
         printf("\n%d failure(s)\n", failures);
         return failures == 0 ? 0 : 1;

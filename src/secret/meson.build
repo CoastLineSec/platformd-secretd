@@ -29,7 +29,13 @@ policy_service_test = executable(
         dependencies : libsystemd,
 )
 
-test('vault', executable('test-vault', 'test-vault.c', 'vault.c', dependencies : libcrypto))
+test('vault', executable(
+        'test-vault',
+        'test-vault.c',
+        'vault.c',
+        c_args : ['-DVAULT_TESTING'],
+        dependencies : libcrypto,
+))
 security_test = executable('test-security', 'test-security.c', dependencies : libsystemd)
 test('integration', find_program('sh'),
      args : [meson.current_source_dir() / 'test-integration.sh', secretd],

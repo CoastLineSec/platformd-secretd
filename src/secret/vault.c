@@ -3,6 +3,7 @@
 #include "vault.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -116,38 +117,60 @@ static int hkdf_sha256(const uint8_t *ikm, size_t ikm_len, uint8_t *out, size_t 
  * in 3.x, but the clearest way to pin RFC 2409 group 2). */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-int vault_dh_transport(const uint8_t *peer_pub, size_t peer_len,
-                       uint8_t **our_pub, size_t *our_pub_len,
-                       uint8_t key_out[VAULT_DH_KEY_LEN]) {
+static DH *dh_group2_new(void) {
         DH *dh = NULL;
-        BIGNUM *p = NULL, *g = NULL, *peer = NULL;
-        const BIGNUM *pub = NULL;
-        uint8_t *shared = NULL;
-        int sz = 0, slen, r = -EIO;
-
-        *our_pub = NULL;
+        BIGNUM *p = NULL, *g = NULL;
 
         p = BN_get_rfc2409_prime_1024(NULL);
         g = BN_new();
         if (!p || !g || BN_set_word(g, 2) != 1)
-                goto out;
+                goto fail;
         dh = DH_new();
         if (!dh || DH_set0_pqg(dh, p, NULL, g) != 1)
-                goto out;
-        p = g = NULL;   /* owned by dh now */
-        if (DH_generate_key(dh) != 1)
-                goto out;
+                goto fail;
+        return dh;
 
+fail:
+        BN_free(p);
+        BN_free(g);
+        DH_free(dh);
+        return NULL;
+}
+
+static int dh_transport_finish(
+                DH *dh,
+                const uint8_t *peer_pub,
+                size_t peer_len,
+                uint8_t **our_pub,
+                size_t *our_pub_len,
+                uint8_t key_out[VAULT_DH_KEY_LEN]) {
+
+        BIGNUM *peer = NULL;
+        const BIGNUM *pub = NULL;
+        uint8_t *shared = NULL;
+        int check, sz = 0, slen, r = -EIO;
+
+        *our_pub = NULL;
+        *our_pub_len = 0;
+        if (!peer_pub || peer_len == 0 || peer_len > INT_MAX)
+                return -EINVAL;
         peer = BN_bin2bn(peer_pub, (int) peer_len, NULL);
         sz = DH_size(dh);
         if (!peer || sz <= 0 || !(shared = malloc((size_t) sz)))
                 goto out;
-        /* Minimal big-endian with leading zeros stripped, matching gcrypt USG. */
-        slen = DH_compute_key(shared, peer, dh);
-        if (slen < 0 || hkdf_sha256(shared, (size_t) slen, key_out, VAULT_DH_KEY_LEN) < 0)
+        if (DH_check_pub_key(dh, peer, &check) != 1 || check != 0) {
+                r = -EINVAL;
+                goto out;
+        }
+        /* libsecret applies HKDF to the group-sized RFC 2631 shared secret. */
+        slen = DH_compute_key_padded(shared, peer, dh);
+        if (slen != sz ||
+            hkdf_sha256(shared, (size_t) sz, key_out, VAULT_DH_KEY_LEN) < 0)
                 goto out;
 
         DH_get0_key(dh, &pub, NULL);
+        if (!pub)
+                goto out;
         *our_pub_len = (size_t) BN_num_bytes(pub);
         if (!(*our_pub = malloc(*our_pub_len ? *our_pub_len : 1)))
                 goto out;
@@ -156,12 +179,92 @@ int vault_dh_transport(const uint8_t *peer_pub, size_t peer_len,
 out:
         if (shared) { vault_wipe(shared, (size_t) sz); free(shared); }
         BN_free(peer);
-        BN_free(p);
-        BN_free(g);
-        DH_free(dh);
-        if (r < 0) { free(*our_pub); *our_pub = NULL; }
+        if (r < 0) {
+                vault_wipe(key_out, VAULT_DH_KEY_LEN);
+                free(*our_pub);
+                *our_pub = NULL;
+                *our_pub_len = 0;
+        }
         return r;
 }
+
+int vault_dh_transport(const uint8_t *peer_pub, size_t peer_len,
+                       uint8_t **our_pub, size_t *our_pub_len,
+                       uint8_t key_out[VAULT_DH_KEY_LEN]) {
+        DH *dh;
+        int r;
+
+        if (!our_pub || !our_pub_len || !key_out)
+                return -EINVAL;
+        *our_pub = NULL;
+        *our_pub_len = 0;
+        vault_wipe(key_out, VAULT_DH_KEY_LEN);
+        dh = dh_group2_new();
+        if (!dh)
+                return -ENOMEM;
+        if (DH_generate_key(dh) != 1)
+                r = -EIO;
+        else
+                r = dh_transport_finish(
+                                dh,
+                                peer_pub,
+                                peer_len,
+                                our_pub,
+                                our_pub_len,
+                                key_out);
+        DH_free(dh);
+        return r;
+}
+
+#ifdef VAULT_TESTING
+int vault_dh_transport_for_test(
+                const uint8_t *peer_pub,
+                size_t peer_len,
+                const uint8_t *private_key,
+                size_t private_key_len,
+                uint8_t **our_pub,
+                size_t *our_pub_len,
+                uint8_t key_out[VAULT_DH_KEY_LEN]) {
+
+        BN_CTX *ctx = NULL;
+        DH *dh = NULL;
+        BIGNUM *priv = NULL, *pub = NULL;
+        const BIGNUM *g, *p;
+        int r = -EIO;
+
+        if (!our_pub || !our_pub_len || !key_out ||
+            !private_key || private_key_len == 0 || private_key_len > INT_MAX)
+                return -EINVAL;
+        *our_pub = NULL;
+        *our_pub_len = 0;
+        vault_wipe(key_out, VAULT_DH_KEY_LEN);
+        dh = dh_group2_new();
+        priv = BN_bin2bn(private_key, (int) private_key_len, NULL);
+        pub = BN_new();
+        ctx = BN_CTX_new();
+        if (!dh || !priv || !pub || !ctx)
+                goto out;
+        DH_get0_pqg(dh, &p, NULL, &g);
+        if (BN_mod_exp(pub, g, priv, p, ctx) != 1 ||
+            DH_set0_key(dh, pub, priv) != 1)
+                goto out;
+        pub = priv = NULL;
+        r = dh_transport_finish(
+                        dh,
+                        peer_pub,
+                        peer_len,
+                        our_pub,
+                        our_pub_len,
+                        key_out);
+
+out:
+        BN_CTX_free(ctx);
+        BN_free(priv);
+        BN_free(pub);
+        DH_free(dh);
+        return r;
+}
+#endif
 #pragma GCC diagnostic pop
 
 int vault_transport_encrypt(const uint8_t key[VAULT_DH_KEY_LEN],

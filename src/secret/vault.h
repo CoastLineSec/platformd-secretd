@@ -47,6 +47,13 @@ int vault_dh_transport(const uint8_t *peer_pub, size_t peer_len,
                        uint8_t **our_pub, size_t *our_pub_len,
                        uint8_t key_out[VAULT_DH_KEY_LEN]);
 
+#ifdef VAULT_TESTING
+int vault_dh_transport_for_test(const uint8_t *peer_pub, size_t peer_len,
+                                const uint8_t *private_key, size_t private_key_len,
+                                uint8_t **our_pub, size_t *our_pub_len,
+                                uint8_t key_out[VAULT_DH_KEY_LEN]);
+#endif
+
 /* AES-128-CBC with PKCS7 padding for the transport. Encrypt generates a fresh
  * IV; decrypt validates the padding. Outputs are malloc'd; caller frees.
  * decrypt returns -EBADMSG on a padding/format failure. */
