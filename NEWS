@@ -1,6 +1,31 @@
 platformd-secretd NEWS
 ======================
 
+CHANGES WITH 0.1.4:
+
+        * Protected item release is now bound to an active, local, unlocked
+          logind session. Responses from platformd-trustd must identify the
+          requested policy and session. Missing, malformed, timed-out, or stale
+          responses fail closed.
+
+        * A fresh-verification or trusted-platform request whose verification
+          is missing or stale now invokes platformd-verifyd and evaluates the
+          policy again after verification. Other policy failures do not start
+          an authentication request.
+
+        * Policy evaluation and verification are asynchronous. Disconnecting
+          the requesting D-Bus client cancels the operation, and a slow
+          authentication request does not block unrelated Secret Service
+          clients.
+
+        * Polkit authorization is used only to clear a manual collection lock.
+          It no longer establishes item-policy freshness.
+
+        * The Diffie-Hellman transport now pads RFC 2631 shared secrets to the
+          IETF group size before applying HKDF and rejects invalid peer public
+          keys. This fixes intermittent libsecret decryption failures when the
+          shared secret begins with zero bytes.
+
 platformd-secretd 0.1.3
 
   * Freshness is established only by an explicit successful verification.
