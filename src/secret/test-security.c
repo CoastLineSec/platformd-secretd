@@ -265,6 +265,74 @@ finish:
         return r;
 }
 
+static int test_bulk(sd_bus *bus, bool reverse, const char *expected) {
+        sd_bus_error error = SD_BUS_ERROR_NULL;
+        sd_bus_message *reply = NULL;
+        char *session = NULL, *fresh = NULL, *trusted = NULL, *ordinary = NULL;
+        const char *path;
+        bool saw_fresh = false, saw_trusted = false, saw_ordinary = false;
+        int r;
+
+        if ((r = open_plain_session(bus, &session)) < 0 ||
+            (r = create_item(bus, session, "platformd.policy", "fresh-verification", &fresh, NULL)) < 0 ||
+            (r = create_item(bus, session, "platformd.policy", "trusted-platform", &trusted, NULL)) < 0 ||
+            (r = create_item(bus, session, "test", "ordinary", &ordinary, NULL)) < 0)
+                goto finish;
+        r = sd_bus_call_method(bus, SECRETS_NAME, SECRETS_PATH, "org.freedesktop.Secret.Service",
+                               "GetSecrets", &error, &reply, "aoo", 3,
+                               reverse ? trusted : fresh, reverse ? fresh : trusted, ordinary, session);
+        if (r < 0 || (r = sd_bus_message_enter_container(reply, 'a', "{o(oayays)}")) < 0)
+                goto finish;
+        while ((r = sd_bus_message_enter_container(reply, 'e', "o(oayays)")) > 0) {
+                const void *parameters, *value;
+                const char *transport, *content_type;
+                size_t parameters_size, value_size;
+
+                if ((r = sd_bus_message_read(reply, "o", &path)) < 0 ||
+                    (r = sd_bus_message_enter_container(reply, 'r', "oayays")) < 0 ||
+                    (r = sd_bus_message_read(reply, "o", &transport)) < 0 ||
+                    (r = sd_bus_message_read_array(reply, 'y', &parameters, &parameters_size)) < 0 ||
+                    (r = sd_bus_message_read_array(reply, 'y', &value, &value_size)) < 0 ||
+                    (r = sd_bus_message_read(reply, "s", &content_type)) < 0 ||
+                    (r = sd_bus_message_exit_container(reply)) < 0 ||
+                    (r = sd_bus_message_exit_container(reply)) < 0)
+                        goto finish;
+                if (strcmp(transport, session) != 0 || parameters_size != 0 ||
+                    value_size != strlen("test-secret") || memcmp(value, "test-secret", value_size) != 0 ||
+                    strcmp(content_type, "text/plain") != 0) {
+                        r = -EBADMSG;
+                        goto finish;
+                }
+                if (strcmp(path, fresh) == 0 && !saw_fresh)
+                        saw_fresh = true;
+                else if (strcmp(path, trusted) == 0 && !saw_trusted)
+                        saw_trusted = true;
+                else if (strcmp(path, ordinary) == 0 && !saw_ordinary)
+                        saw_ordinary = true;
+                else {
+                        r = -EBADMSG;
+                        goto finish;
+                }
+        }
+        if (r >= 0 && (!saw_ordinary ||
+                      saw_fresh != (strcmp(expected, "none") != 0) ||
+                      saw_trusted != (strcmp(expected, "both") == 0))) {
+                fprintf(stderr, "Unexpected bulk release: fresh=%d trusted=%d ordinary=%d\n",
+                        saw_fresh, saw_trusted, saw_ordinary);
+                r = -EACCES;
+        }
+finish:
+        if (r < 0)
+                fprintf(stderr, "Bulk policy test failed: %s\n", error.message ?: strerror(-r));
+        sd_bus_error_free(&error);
+        sd_bus_message_unref(reply);
+        free(session);
+        free(fresh);
+        free(trusted);
+        free(ordinary);
+        return r;
+}
+
 int main(int argc, char **argv) {
         sd_bus *owner = NULL, *other = NULL;
         char *session = NULL, *orphan = NULL, *prompt = NULL, *item = NULL;
@@ -278,6 +346,10 @@ int main(int argc, char **argv) {
 
         if (argc > 1 && strcmp(argv[1], "persistence") == 0) {
                 r = create_collection_expect_failure(owner);
+                goto finish;
+        }
+        if (argc == 4 && strcmp(argv[1], "bulk") == 0) {
+                r = test_bulk(owner, strcmp(argv[3], "reverse") == 0, argv[2]);
                 goto finish;
         }
 

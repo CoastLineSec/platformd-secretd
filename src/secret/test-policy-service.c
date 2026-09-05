@@ -25,6 +25,8 @@ typedef struct PendingReply {
         sd_bus_message *message;
         sd_event_source *timer;
         char *cancel_id;
+        char *policy;
+        char *session;
         bool polkit;
 } PendingReply;
 
@@ -37,6 +39,7 @@ struct Fake {
         unsigned verify_calls;
         unsigned polkit_calls;
         unsigned cancel_calls;
+        uint64_t bulk_expiration;
         PendingReply *pending;
 };
 
@@ -54,6 +57,8 @@ static void pending_free(PendingReply *pending) {
         sd_varlink_unref(pending->link);
         sd_bus_message_unref(pending->message);
         free(pending->cancel_id);
+        free(pending->policy);
+        free(pending->session);
         free(pending);
 }
 
@@ -84,12 +89,22 @@ static int reply_policy(
                                              "reasonCode",
                                              SD_JSON_BUILD_STRING(reason_code)),
                              SD_JSON_BUILD_PAIR("reason", SD_JSON_BUILD_STRING("test policy result")),
-                             SD_JSON_BUILD_PAIR("windowSec", SD_JSON_BUILD_UNSIGNED(300)))) < 0 ||
+                             SD_JSON_BUILD_PAIR("windowSec", SD_JSON_BUILD_UNSIGNED(
+                                             streq(fake_instance->mode, "bulk-expiry") ? 1 : 300)))) < 0 ||
             (r = sd_json_buildo(
                              &reply,
                              SD_JSON_BUILD_PAIR("result", SD_JSON_BUILD_VARIANT(record)))) < 0)
                 return r;
         return sd_varlink_reply(link, reply);
+}
+
+static int delayed_policy(sd_event_source *source, uint64_t usec, void *userdata) {
+        PendingReply *pending = userdata;
+
+        pending->timer = sd_event_source_unref(pending->timer);
+        (void) reply_policy(pending->link, pending->policy, pending->session, false, "boot-not-verified");
+        pending_free(pending);
+        return 0;
 }
 
 static int evaluate_policy(
@@ -112,9 +127,43 @@ static int evaluate_policy(
                 return sd_varlink_replybo(
                                 link,
                                 SD_JSON_BUILD_PAIR("unexpected", SD_JSON_BUILD_BOOLEAN(true)));
-        if (streq(fake->mode, "satisfied"))
+        if (streq(fake->mode, "bulk-expiry")) {
+                uint64_t now;
+
+                if (sd_event_now(fake->event, CLOCK_MONOTONIC, &now) < 0)
+                        return -EIO;
+                if (fake->bulk_expiration == 0)
+                        fake->bulk_expiration = now + 1000000U;
+                if (streq(policy, "local-trusted-session")) {
+                        PendingReply *pending = calloc(1, sizeof *pending);
+
+                        if (!pending)
+                                return -ENOMEM;
+                        pending->fake = fake;
+                        pending->link = sd_varlink_ref(link);
+                        pending->policy = strdup(policy);
+                        pending->session = strdup(session);
+                        pending->next = fake->pending;
+                        fake->pending = pending;
+                        if (!pending->policy || !pending->session ||
+                            sd_event_add_time_relative(fake->event, &pending->timer, CLOCK_MONOTONIC,
+                                                       1500000U, 10000U, delayed_policy, pending) < 0) {
+                                pending_free(pending);
+                                return -ENOMEM;
+                        }
+                        return 1;
+                }
+                satisfied = now < fake->bulk_expiration;
+        } else if (streq(fake->mode, "satisfied"))
                 satisfied = true;
-        else if (streq(fake->mode, "stale-then-success") ||
+        else if (streq(fake->mode, "bulk-fresh-only")) {
+                satisfied = streq(policy, "fresh-user-verification");
+                reason = "boot-not-verified";
+        } else if (streq(fake->mode, "bulk-malformed")) {
+                if (streq(policy, "local-trusted-session"))
+                        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR("unexpected", SD_JSON_BUILD_BOOLEAN(true)));
+                satisfied = true;
+        } else if (streq(fake->mode, "stale-then-success") ||
                  streq(fake->mode, "verify-delay") ||
                  streq(fake->mode, "verify-malformed"))
                 satisfied = fake->trust_calls > 1;
@@ -141,7 +190,8 @@ static int delayed_verify(sd_event_source *source, uint64_t usec, void *userdata
         pending->timer = sd_event_source_unref(pending->timer);
         (void) sd_varlink_replybo(
                         pending->link,
-                        SD_JSON_BUILD_PAIR("verified", SD_JSON_BUILD_BOOLEAN(true)),
+                        SD_JSON_BUILD_PAIR("verified", SD_JSON_BUILD_BOOLEAN(
+                                        !streq(pending->fake->mode, "verify-delay-decline"))),
                         SD_JSON_BUILD_PAIR("method", SD_JSON_BUILD_STRING("platformd-verify")),
                         SD_JSON_BUILD_PAIR("realtimeUSec", SD_JSON_BUILD_UNSIGNED(1)));
         pending_free(pending);
@@ -163,7 +213,7 @@ static int verify_user(
                 return sd_varlink_replybo(
                                 link,
                                 SD_JSON_BUILD_PAIR("verified", SD_JSON_BUILD_BOOLEAN(true)));
-        if (streq(fake->mode, "verify-delay")) {
+        if (streq(fake->mode, "verify-delay") || streq(fake->mode, "verify-delay-decline")) {
                 PendingReply *pending = calloc(1, sizeof *pending);
                 if (!pending)
                         return -ENOMEM;
@@ -188,7 +238,8 @@ static int verify_user(
                         link,
                         SD_JSON_BUILD_PAIR(
                                         "verified",
-                                        SD_JSON_BUILD_BOOLEAN(!streq(fake->mode, "verify-decline"))),
+                                        SD_JSON_BUILD_BOOLEAN(!streq(fake->mode, "verify-decline") &&
+                                                              !streq(fake->mode, "bulk-expiry"))),
                         SD_JSON_BUILD_PAIR("method", SD_JSON_BUILD_STRING("platformd-verify")),
                         SD_JSON_BUILD_PAIR("realtimeUSec", SD_JSON_BUILD_UNSIGNED(1)));
 }

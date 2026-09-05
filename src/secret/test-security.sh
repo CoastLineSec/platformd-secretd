@@ -3,6 +3,13 @@
 
 set -eu
 
+if [ "${1:-}" != --test-inner ]; then
+    command -v dbus-run-session >/dev/null 2>&1 || exit 77
+    exec sh "$(dirname "$0")/test-env.sh" dbus-run-session \
+        --config-file="$(dirname "$0")/test-bus.conf" -- sh "$0" --test-inner "$@"
+fi
+shift
+
 DAEMON="${1:?usage: test-security.sh /path/to/platformd-secretd /path/to/test-security}"
 CLIENT="${2:?usage: test-security.sh /path/to/platformd-secretd /path/to/test-security}"
 
@@ -13,13 +20,11 @@ for tool in dbus-run-session busctl; do
         }
 done
 
-if [ -z "${PLATFORMD_TEST_INNER:-}" ]; then
-        PLATFORMD_TEST_INNER=1 exec dbus-run-session -- sh "$0" "$DAEMON" "$CLIENT"
-fi
-
 WORK="$(mktemp -d)"
 PID=
-trap 'test -z "$PID" || kill "$PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT INT TERM
+trap 'test -z "$PID" || { kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; }; rm -rf "$WORK"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 wait_for_service() {
         i=0

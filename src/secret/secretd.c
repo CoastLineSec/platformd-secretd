@@ -748,6 +748,9 @@ static bool item_protected(Item *item) {
 }
 
 static int gate_mutation(Item *item, sd_bus_message *m, sd_bus_error *e) {
+        if (collection_locked(manager_instance))
+                return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
+                                        "The collection is locked");
         if (!item_protected(item))
                 return 0;
         if (trust_gate(item, caller_grade(m, "secret-mutate"), m) != GATE_ALLOW)
@@ -812,6 +815,7 @@ struct StepUp {
         size_t n_bulk_policies;
         size_t bulk_policy_index;
         bool bulk;
+        bool verification_attempted;
 };
 
 static void stepup_free(StepUp *su) {
@@ -1062,7 +1066,17 @@ static void stepup_policy_done(StepUp *su, bool allowed) {
                 return;
         }
 
-        su->bulk_allowed[su->bulk_policy_index] = allowed;
+        if (allowed) {
+                su->bulk_allowed[su->bulk_policy_index] = true;
+                /* local-trusted-session includes fresh-user-verification. */
+                if (streq(su->trust_policy, "local-trusted-session"))
+                        for (size_t i = 0; i < su->n_bulk_policies; i++)
+                                if (streq(su->bulk_trust_policies[i], "fresh-user-verification"))
+                                        su->bulk_allowed[i] = true;
+                stepup_finish_bulk(su);
+                return;
+        }
+
         su->bulk_policy_index++;
         if (su->bulk_policy_index >= su->n_bulk_policies) {
                 stepup_finish_bulk(su);
@@ -1237,6 +1251,7 @@ static int stepup_call_trustd(StepUp *su) {
         const char *socket = getenv("PLATFORMD_TRUST_SOCKET");
         int r;
 
+        memset(su->bulk_allowed, 0, sizeof su->bulk_allowed);
         su->vl = sd_varlink_unref(su->vl);
         r = sd_varlink_connect_address(
                         &su->vl,
@@ -1273,6 +1288,10 @@ static int stepup_call_verifyd(StepUp *su) {
         const char *reason;
         int r;
 
+        if (su->verification_attempted)
+                return -EALREADY;
+        su->verification_attempted = true;
+        memset(su->bulk_allowed, 0, sizeof su->bulk_allowed);
         su->vl = sd_varlink_unref(su->vl);
         r = sd_varlink_connect_address(
                         &su->vl,
@@ -1310,6 +1329,7 @@ static int stepup_deadline(sd_event_source *source, uint64_t usec, void *userdat
         StepUp *su = userdata;
 
         su->deadline = sd_event_source_unref(su->deadline);
+        memset(su->bulk_allowed, 0, sizeof su->bulk_allowed);
         if (su->bulk)
                 stepup_finish_bulk(su);
         else
@@ -1455,6 +1475,12 @@ static int stepup_begin_bulk(
                         return -E2BIG;
                 }
                 size_t k = su->n_bulk_policies++;
+                if (k > 0 && streq(trust_policy, "local-trusted-session")) {
+                        su->bulk_trust_policies[k] = su->bulk_trust_policies[0];
+                        su->bulk_item_paths[k] = su->bulk_item_paths[0];
+                        su->bulk_item_policies[k] = su->bulk_item_policies[0];
+                        k = 0;
+                }
                 su->bulk_trust_policies[k] = strdup(trust_policy);
                 su->bulk_item_paths[k] = strdup(item->path);
                 su->bulk_item_policies[k] = strdup(item_policy);
@@ -1661,8 +1687,10 @@ static int item_set_label(sd_bus *bus, const char *path, const char *interface, 
         char *old_label;
         uint64_t old_modified;
         const char *l;
-        int r = sd_bus_message_read(value, "s", &l);
-        if (r < 0)
+        int r;
+
+        if ((r = gate_mutation(item, value, ret_error)) < 0 ||
+            (r = sd_bus_message_read(value, "s", &l)) < 0)
                 return r;
         if (!(new_label = strdup(l ? l : "")))
                 return -ENOMEM;
@@ -1947,43 +1975,87 @@ static int read_file(const char *path, uint8_t **data, size_t *len) {
         return 0;
 }
 
-/* Load the vault key from a systemd credential ($CREDENTIALS_DIRECTORY/vault-key)
- * or, for development, the file named by $SECRETD_VAULT_KEY_FILE. It must be
- * exactly VAULT_KEY_LEN raw bytes. With no key the store is kept in the clear;
- * appropriate when the home is already encrypted (systemd-homed luks/fscrypt) or
- * when only file-permission privacy is wanted. The key stays mlock'd. */
-static void load_vault_key(void) {
-        const char *creddir = getenv("CREDENTIALS_DIRECTORY");
-        const char *devfile = getenv("SECRETD_VAULT_KEY_FILE");
-        _cleanup_free_ char *path = NULL;
-        _cleanup_free_ uint8_t *data = NULL;
+static int read_vault_key_at(int dir_fd, const char *path) {
+        uint8_t data[VAULT_KEY_LEN + 1] = {};
+        struct stat st;
         size_t len = 0;
+        int fd, r;
 
-        if (creddir && *creddir) {
-                if (asprintf(&path, "%s/vault-key", creddir) < 0)
-                        return;
-        } else if (devfile && *devfile) {
-                if (!(path = strdup(devfile)))
-                        return;
-        } else
-                return;   /* no key configured, store in the clear */
+        fd = openat(dir_fd, path, O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
+        if (fd < 0)
+                return -errno;
+        if (fstat(fd, &st) < 0) {
+                r = -errno;
+                goto finish;
+        }
+        if (!S_ISREG(st.st_mode) || st.st_size != VAULT_KEY_LEN) {
+                r = -EINVAL;
+                goto finish;
+        }
 
-        if (read_file(path, &data, &len) < 0) {
-                sd_journal_print(LOG_WARNING, "vault key %s unreadable; storing in the clear", path);
-                return;
+        while (len < sizeof data) {
+                ssize_t n = read(fd, data + len, sizeof data - len);
+
+                if (n < 0) {
+                        if (errno == EINTR)
+                                continue;
+                        r = -errno;
+                        goto finish;
+                }
+                if (n == 0)
+                        break;
+                len += (size_t) n;
         }
         if (len != VAULT_KEY_LEN) {
-                sd_journal_print(LOG_WARNING, "vault key must be %u raw bytes (got %zu); storing in the clear",
-                                 VAULT_KEY_LEN, len);
-                vault_wipe(data, len);
-                return;
+                r = -EINVAL;
+                goto finish;
         }
+
         memcpy(g_vault_key, data, VAULT_KEY_LEN);
-        vault_wipe(data, len);
+        r = 0;
+finish:
+        vault_wipe(data, sizeof data);
+        (void) close(fd);
+        return r;
+}
+
+static int load_vault_key(void) {
+        const char *creddir = getenv("CREDENTIALS_DIRECTORY");
+        const char *devfile = getenv("SECRETD_VAULT_KEY_FILE");
+        int r = -ENOENT;
+
+        if (creddir && *creddir) {
+                struct stat st;
+                int fd = open(creddir, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+
+                if (fd < 0)
+                        return -errno;
+                r = read_vault_key_at(fd, "vault-key");
+                if (r == -ENOENT) {
+                        /* A dangling symlink is a supplied, unusable credential. */
+                        if (fstatat(fd, "vault-key", &st, AT_SYMLINK_NOFOLLOW) >= 0)
+                                r = -EINVAL;
+                        else if (errno != ENOENT)
+                                r = -errno;
+                }
+                (void) close(fd);
+                if (r < 0 && r != -ENOENT)
+                        return r;
+        }
+
+        if (r == -ENOENT) {
+                if (!devfile || !*devfile)
+                        return 0;
+                r = read_vault_key_at(AT_FDCWD, devfile);
+                if (r < 0)
+                        return r;
+        }
+
         if (mlock(g_vault_key, sizeof g_vault_key) < 0)
                 sd_journal_print(LOG_WARNING, "mlock of vault key failed (%s); continuing", strerror(errno));
         g_encrypting = true;
         sd_journal_print(LOG_INFO, "vault key loaded, store is encrypted (AES-256-GCM)");
+        return 0;
 }
 
 static int manager_serialize(Manager *mgr, Buf *out) {
@@ -2318,6 +2390,10 @@ static int collection_create_item(sd_bus_message *m, void *userdata, sd_bus_erro
         size_t store_len;
         Session *sess;
 
+        if (collection_locked(mgr))
+                return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
+                                        "The collection is locked");
+
         /* properties a{sv}: we care about Label (s) and Attributes (a{ss}). */
         r = sd_bus_message_enter_container(m, 'a', "{sv}");
         if (r < 0)
@@ -2546,6 +2622,9 @@ static int collection_delete(sd_bus_message *m, void *userdata, sd_bus_error *e)
         Collection **link;
         int r;
 
+        if (collection_locked(mgr))
+                return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
+                                        "The collection is locked");
         if (streq(coll->path, COLLECTION_PATH))
                 return sd_bus_error_set(e, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "The default collection cannot be deleted");
@@ -3303,8 +3382,9 @@ static const sd_bus_vtable service_vtable[] = {
  *
  * The desktop's lock state drives the store's lock state: when the session
  * locks, secrets become unavailable; when it unlocks, they return. logind
- * reports this on the login1 Session object via the Lock/Unlock signals and the
- * LockedHint property.
+ * reports this on the login1 Session object via the LockedHint property. A Lock
+ * request locks the store immediately; an Unlock request does not confirm that
+ * the session has unlocked.
  *
  * The signal matches are installed for all session objects and filtered against
  * mgr->my_session is the login1 path of the display session and is re-resolved
@@ -3368,47 +3448,46 @@ static int on_session_lock(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         return 0;
 }
 
-static int on_session_unlock(sd_bus_message *m, void *userdata, sd_bus_error *e) {
-        Manager *mgr = userdata;
-        bool was = collection_locked(mgr);
-        if (!is_my_session(mgr, m))
-                return 0;
-        mgr->desktop_locked = false;
-        if (was != collection_locked(mgr))
-                emit_locked_changed();
-        return 0;
-}
-
 static int on_session_props(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         Manager *mgr = userdata;
-        const char *iface;
+        const char *iface, *name;
+        int locked = -1, r;
 
         if (!is_my_session(mgr, m))
                 return 0;
         if (sd_bus_message_read(m, "s", &iface) < 0 ||
+            !streq(iface, "org.freedesktop.login1.Session") ||
             sd_bus_message_enter_container(m, 'a', "{sv}") < 0)
                 return 0;
-        while (sd_bus_message_enter_container(m, 'e', "sv") > 0) {
-                const char *name;
+
+        while ((r = sd_bus_message_enter_container(m, 'e', "sv")) > 0) {
                 if (sd_bus_message_read(m, "s", &name) < 0)
-                        break;
+                        return 0;
                 if (streq(name, "LockedHint")) {
-                        int locked = 0;
-                        if (sd_bus_message_enter_container(m, 'v', "b") >= 0 &&
-                            sd_bus_message_read(m, "b", &locked) >= 0) {
-                                (void) sd_bus_message_exit_container(m);
-                                if ((bool) locked != mgr->desktop_locked) {
-                                        bool was = collection_locked(mgr);
-                                        mgr->desktop_locked = locked;
-                                        if (was != collection_locked(mgr))
-                                                emit_locked_changed();
-                                }
-                        }
-                } else
-                        (void) sd_bus_message_skip(m, "v");
-                (void) sd_bus_message_exit_container(m);
+                        if (locked >= 0 ||
+                            sd_bus_message_enter_container(m, 'v', "b") < 0 ||
+                            sd_bus_message_read(m, "b", &locked) < 0 ||
+                            sd_bus_message_exit_container(m) < 0)
+                                return 0;
+                } else if (sd_bus_message_skip(m, "v") < 0)
+                        return 0;
+                if (sd_bus_message_exit_container(m) < 0)
+                        return 0;
         }
-        (void) sd_bus_message_exit_container(m);
+        if (r < 0 ||
+            sd_bus_message_exit_container(m) < 0 ||
+            sd_bus_message_enter_container(m, 'a', "s") < 0)
+                return 0;
+        while ((r = sd_bus_message_read(m, "s", &name)) > 0)
+                if (streq(name, "LockedHint"))
+                        locked = true;
+        if (r < 0 || sd_bus_message_exit_container(m) < 0 || locked < 0)
+                return 0;
+
+        bool was = collection_locked(mgr);
+        mgr->desktop_locked = locked;
+        if (was != collection_locked(mgr))
+                emit_locked_changed();
         return 0;
 }
 
@@ -3423,8 +3502,6 @@ static void setup_logind_lock(Manager *mgr, sd_event *event) {
          * sessions (and which is ours) can change over the daemon's lifetime. */
         (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", NULL,
                                    "org.freedesktop.login1.Session", "Lock", on_session_lock, mgr);
-        (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", NULL,
-                                   "org.freedesktop.login1.Session", "Unlock", on_session_unlock, mgr);
         (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", NULL,
                                    "org.freedesktop.DBus.Properties", "PropertiesChanged", on_session_props, mgr);
         (void) sd_bus_match_signal(mgr->system_bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
@@ -3591,6 +3668,9 @@ int main(void) {
         Manager manager = {};
         int r;
 
+        if ((r = load_vault_key()) < 0)
+                return fail("load vault key", r);
+
         if ((r = sd_event_default(&event)) < 0)
                 return fail("sd_event_default", r);
 
@@ -3619,7 +3699,6 @@ int main(void) {
         if ((r = sd_bus_add_object_vtable(bus, NULL, ALIAS_PATH,
                                           "org.freedesktop.Secret.Collection", collection_vtable, defcoll)) < 0)
                 return fail("install default-alias vtable", r);
-        load_vault_key();         /* enables encryption if a vault key is configured */
         manager_load(&manager);   /* restore persisted items (registers their objects) */
         manager.home_storage = query_home_storage();
         if (!g_encrypting && manager.home_storage) {

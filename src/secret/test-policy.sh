@@ -3,6 +3,13 @@
 
 set -eu
 
+if [ "${1:-}" != --test-inner ]; then
+    command -v dbus-run-session >/dev/null 2>&1 || exit 77
+    exec sh "$(dirname "$0")/test-env.sh" dbus-run-session \
+        --config-file="$(dirname "$0")/test-bus.conf" -- sh "$0" --test-inner "$@"
+fi
+shift
+
 DAEMON="${1:?missing test daemon}"
 FAKE="${2:?missing policy service}"
 SECRETCTL="${3:?missing secretctl}"
@@ -14,10 +21,6 @@ for tool in dbus-run-session secret-tool busctl varlinkctl timeout; do
         }
 done
 
-if [ -z "${PLATFORMD_TEST_INNER:-}" ]; then
-        PLATFORMD_TEST_INNER=1 exec dbus-run-session -- sh "$0" "$DAEMON" "$FAKE" "$SECRETCTL"
-fi
-
 WORK="$(mktemp -d)"
 daemon_pid=
 fake_pid=
@@ -25,7 +28,12 @@ lookup_pid=
 trap 'test -z "$lookup_pid" || kill "$lookup_pid" 2>/dev/null || true
       test -z "$daemon_pid" || kill "$daemon_pid" 2>/dev/null || true
       test -z "$fake_pid" || kill "$fake_pid" 2>/dev/null || true
-      rm -rf "$WORK"' EXIT INT TERM
+      test -z "$lookup_pid" || wait "$lookup_pid" 2>/dev/null || true
+      test -z "$daemon_pid" || wait "$daemon_pid" 2>/dev/null || true
+      test -z "$fake_pid" || wait "$fake_pid" 2>/dev/null || true
+      rm -rf "$WORK"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 wait_for_path() {
         path="$1"

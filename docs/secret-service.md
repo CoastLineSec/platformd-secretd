@@ -146,12 +146,20 @@ platformd-secretd does not create or cache verification freshness. trustd is the
 only freshness authority. verifyd performs authentication and reports a
 successful verification event to trustd.
 
+For a bulk read containing both item policies, `local-trusted-session` is
+evaluated first. It includes the requirements of `fresh-user-verification`, so
+a successful result permits both groups of items. Otherwise, the weaker policy
+is evaluated separately and may permit only its own items. A positive policy
+result is used for the final reply and is not retained across another policy
+query or verification request. Each bulk operation requests verification at
+most once. On timeout, no protected items are returned.
+
 ## Protected mutation
 
 An item carrying any `platformd.*` attribute is protected against mutation.
-`SetSecret`, `Attributes` changes, `Delete`, replace-on-create, and collection
-deletion require the current item policy to be satisfied. Mutation does not
-invoke verifyd. A failed or unavailable trustd query denies the mutation.
+`SetSecret`, `Attributes` and `Label` changes, `Delete`, replace-on-create, and
+collection deletion require the current item policy to be satisfied. Mutation
+does not invoke verifyd. A failed or unavailable trustd query denies the mutation.
 
 `platformd.min-grade` accepts:
 
@@ -173,8 +181,18 @@ The effective collection lock is the logical OR of:
 - the `LockedHint` state of the tracked logind session
 - the manual lock set by Secret Service `Lock`
 
-An observed logind unlock changes only collection lock state. It does not count
-as user verification and does not refresh a trustd policy.
+A logind `Lock` request also locks the store immediately. An `Unlock` request
+does not clear the desktop lock; the tracked session must report
+`LockedHint=false`. Invalidation of `LockedHint` treats the session as locked
+until the property is reported again.
+
+Locked collections reject item creation, replacement, secret and metadata
+changes, item deletion, and collection deletion with
+`org.freedesktop.Secret.Error.IsLocked`. This applies independently of optional
+item release policies.
+
+A confirmed logind unlock changes only collection lock state. It does not
+clear a manual lock, count as user verification, or refresh a trustd policy.
 
 ## Storage
 
@@ -192,15 +210,20 @@ serializes and writes the complete new state before accepting a mutation. An
 unreadable, malformed, encrypted-without-key, or unsupported store makes the
 daemon read-only so the existing file is not replaced.
 
-The optional `vault-key` systemd credential must contain exactly 32 bytes. When
-present, the serialized payload is encrypted with AES-256-GCM. Without the
-credential, the payload is stored in cleartext. The deployment must provide
-protection through an encrypted home or another storage mechanism when
-cleartext storage is not acceptable.
+The optional `vault-key` systemd credential must be a regular file containing
+exactly 32 bytes. When present, the serialized payload is encrypted with
+AES-256-GCM. Without a configured key, the payload is stored in cleartext.
+The deployment must provide protection through an encrypted home or another
+storage mechanism when cleartext storage is not acceptable.
 
-The daemon reads the credential from
-`$CREDENTIALS_DIRECTORY/vault-key`. `SECRETD_VAULT_KEY_FILE` is available for
-test and development environments.
+The daemon reads the credential from `$CREDENTIALS_DIRECTORY/vault-key`.
+An existing credential directory without `vault-key` does not enable encryption.
+If the credential is absent, `SECRETD_VAULT_KEY_FILE` can select a key file for
+testing. A supplied credential takes precedence over this setting.
+
+An inaccessible credential directory, an unreadable or malformed credential,
+or failure to load an explicitly selected key file causes startup to fail.
+No store is created or modified in this case.
 
 Plaintext buffers and the vault key are cleansed after use. The key is locked in
 memory where supported. The service unit disables core dumps and swap for the

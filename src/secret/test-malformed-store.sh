@@ -1,24 +1,37 @@
 #!/bin/sh
 # SPDX-License-Identifier: LGPL-2.1-or-later
-#
-# Parser robustness ("fuzz-lite"): feed truncated, bit-flipped, and hostile
-# on-disk store files to platformd-secretd and confirm it never crashes; it
-# must reject a malformed store and still come up with writes disabled. Most
-# valuable against an ASan/UBSan build, where a parser memory bug aborts the
-# process and is caught here. Isolated on a private bus. Skips (77) without tools.
 
 set -eu
+
+if [ "${1:-}" != --test-inner ]; then
+    command -v dbus-run-session >/dev/null 2>&1 || exit 77
+    exec sh "$(dirname "$0")/test-env.sh" dbus-run-session \
+        --config-file="$(dirname "$0")/test-bus.conf" -- sh "$0" --test-inner "$@"
+fi
+shift
 
 DAEMON="${1:?usage: test-malformed-store.sh /path/to/platformd-secretd}"
 for t in dbus-run-session busctl secret-tool dd; do
         command -v "$t" >/dev/null 2>&1 || { echo "SKIP: $t not found"; exit 77; }
 done
-if [ -z "${PLATFORMD_TEST_INNER:-}" ]; then
-        PLATFORMD_TEST_INNER=1 exec dbus-run-session -- sh "$0" "$DAEMON"
-fi
-
 NAME=org.freedesktop.secrets
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+WORK="$(mktemp -d)"
+pid=
+spid=
+
+cleanup() {
+    for test_pid in "$pid" "$spid"; do
+        test -z "$test_pid" || kill "$test_pid" 2>/dev/null || true
+    done
+    for test_pid in "$pid" "$spid"; do
+        test -z "$test_pid" || wait "$test_pid" 2>/dev/null || true
+    done
+    rm -rf "$WORK"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Start the daemon with a given store file; return 0 if it survived (came up, or
 # exited cleanly), non-zero only if it was killed by a signal (segv / ASan abort).
@@ -36,9 +49,11 @@ survives() {
         if kill -0 "$pid" 2>/dev/null; then
                 kill -TERM "$pid" 2>/dev/null || true
                 wait "$pid" 2>/dev/null || true
+                pid=
                 return 0
         fi
         wait "$pid" 2>/dev/null; rc=$?
+        pid=
         [ "$rc" -lt 128 ]   # <128: clean exit; >=128: died on a signal = crash
 }
 
@@ -48,6 +63,7 @@ spid=$!
 i=0; while [ $i -lt 200 ]; do busctl --user status "$NAME" >/dev/null 2>&1 && break; i=$((i + 1)); done
 printf 'seed-secret' | XDG_DATA_HOME="$WORK/seed" secret-tool store --label='seed' a b c d >/dev/null 2>&1 || true
 kill -TERM "$spid" 2>/dev/null || true; wait "$spid" 2>/dev/null || true
+spid=
 VALID="$WORK/seed/platformd-secretd/secrets"
 [ -f "$VALID" ] || { echo "FAIL: could not seed a valid store"; exit 1; }
 SZ=$(wc -c < "$VALID")
