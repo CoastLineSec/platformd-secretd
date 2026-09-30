@@ -147,6 +147,56 @@ expect_denial verify-malformed
 expect_denial malformed
 expect_denial no-verify
 expect_denial no-trust
+expect_denial wrong-policy
+expect_denial wrong-session
+expect_denial wrong-reason
+
+for mode in satisfied wrong-policy wrong-session wrong-reason mutation-timeout; do
+        start_case "$mode"
+        store_item protected fresh-verification protected-value
+        printf 'open-value' | secret-tool store --label=open scenario open
+        item_path=$(busctl --user call org.freedesktop.secrets /org/freedesktop/secrets \
+                org.freedesktop.Secret.Service SearchItems 'a{ss}' 1 scenario protected |
+                sed -n 's/^[^"]*"\([^"]*\)".*/\1/p')
+        busctl --user set-property org.freedesktop.secrets "$item_path" \
+                org.freedesktop.Secret.Item Label s changed >"$case_dir/mutation.out" 2>&1 &
+        lookup_pid=$!
+        if [ "$mode" = mutation-timeout ]; then
+                sleep 0.1
+                [ "$(timeout 1 secret-tool lookup scenario open)" = open-value ] || {
+                        echo 'FAIL: a pending mutation blocked an ordinary read'
+                        exit 1
+                }
+        fi
+        mutation_status=0
+        wait "$lookup_pid" || mutation_status=$?
+        lookup_pid=
+        if [ "$mode" = satisfied ]; then
+                [ "$mutation_status" = 0 ] || { cat "$case_dir/mutation.out"; exit 1; }
+        else
+                [ "$mutation_status" != 0 ] || { echo "FAIL: $mode authorized mutation"; exit 1; }
+                [ "$(busctl --user get-property org.freedesktop.secrets "$item_path" \
+                        org.freedesktop.Secret.Item Label)" = 's "protected"' ]
+        fi
+        stop_case
+done
+
+start_case mutation-delay
+store_item protected fresh-verification protected-value
+item_path=$(busctl --user call org.freedesktop.secrets /org/freedesktop/secrets \
+        org.freedesktop.Secret.Service SearchItems 'a{ss}' 1 scenario protected |
+        sed -n 's/^[^"]*"\([^"]*\)".*/\1/p')
+busctl --user set-property org.freedesktop.secrets "$item_path" \
+        org.freedesktop.Secret.Item Label s changed >/dev/null 2>&1 &
+lookup_pid=$!
+sleep 0.1
+"$SECRETCTL" lock >/dev/null
+if wait "$lookup_pid"; then
+        echo 'FAIL: mutation survived a lock transition'
+        exit 1
+fi
+lookup_pid=
+stop_case
 
 start_case locked
 store_item item fresh-verification test-value

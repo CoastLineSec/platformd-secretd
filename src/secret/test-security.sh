@@ -44,10 +44,13 @@ wait "$PID" 2>/dev/null || true
 PID=
 
 mkdir -p "$WORK/unwritable"
-printf 'not-a-directory' > "$WORK/unwritable/platformd-secretd"
 XDG_DATA_HOME="$WORK/unwritable" "$DAEMON" >/dev/null 2>&1 &
 PID=$!
 wait_for_service
+busctl --user get-property org.freedesktop.secrets /org/freedesktop/secrets \
+        org.freedesktop.Secret.Service Collections >/dev/null
+mv "$WORK/unwritable/platformd-secretd" "$WORK/blocked-store"
+printf 'not-a-directory' > "$WORK/unwritable/platformd-secretd"
 "$CLIENT" persistence
 
 echo "PASS: storage failures are returned to callers"

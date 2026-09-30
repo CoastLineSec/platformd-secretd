@@ -7,13 +7,15 @@ project('platformd', 'c',
                 'warning_level=2',
         ])
 
-add_project_arguments('-D_GNU_SOURCE', '-Wno-unused-parameter', language : 'c')
+add_project_arguments('-D_GNU_SOURCE', '-Wno-unused-parameter',
+                      '-DPROGRAM_VERSION="@0@"'.format(meson.project_version()), language : 'c')
 
 libsystemd = dependency('libsystemd', version : '>= 257')
 libcrypto = dependency('libcrypto', version : '>= 3.0')
 
 subdir('src/secret')
 subdir('man')
+install_data('src/secret/io.platformd.Secret.varlink', install_dir : get_option('datadir') / 'varlink')
 
 conf = configuration_data()
 conf.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))

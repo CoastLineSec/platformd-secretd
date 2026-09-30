@@ -34,6 +34,7 @@ and retrieve secrets.
 ```sh
 meson setup build --prefix=/usr
 meson compile -C build
+meson test -C build
 sudo meson install -C build
 ```
 
@@ -43,6 +44,9 @@ platformd-secretd after disabling any other Secret Service provider:
 ```sh
 systemctl --user enable --now platformd-secretd.service
 ```
+
+Collections share one lock state. Persistent stores are upgraded to version 3
+when loaded; earlier package versions cannot read the upgraded format.
 
 See [docs/secret-service.md](docs/secret-service.md) and the
 `platformd-secretd.service(8)` and `secretctl(1)` manual pages.

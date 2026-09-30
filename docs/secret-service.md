@@ -29,13 +29,14 @@ The service uses this object hierarchy:
 /org/freedesktop/secrets/collection/default
 /org/freedesktop/secrets/aliases/default
 /org/freedesktop/secrets/collection/cN
-/org/freedesktop/secrets/collection/cN/N
+/org/freedesktop/secrets/collection/cN/iID
 /org/freedesktop/secrets/session/N
 /org/freedesktop/secrets/prompt/N
 ```
 
-The default collection is also available at
-`/org/freedesktop/secrets/aliases/default`.
+The `default` alias initially names the default collection. Aliases can be
+assigned or removed with `SetAlias` and persist across restarts. An alias path
+exports the same Collection interface as its canonical target.
 
 ### org.freedesktop.Secret.Service
 
@@ -59,6 +60,11 @@ connection that created it. Another connection cannot use or close it.
 policy. Policy evaluation and verification are asynchronous. A pending protected
 read does not block unrelated D-Bus or Varlink requests.
 
+All collections share one lock state. `Lock` and `Unlock` ignore unknown object
+paths, and an empty object list is a no-op. Locking a known collection or item
+locks the provider and returns all affected canonical collection and item
+paths. Lock changes are signaled on collections, aliases, and items.
+
 `Lock` sets the manual lock state. `Unlock` is refused while the tracked logind
 session is locked. Clearing the manual lock returns a Prompt object. Prompt
 authorization uses the polkit action
@@ -78,7 +84,8 @@ Collections implement:
 - `Modified`
 
 The default collection cannot be deleted. Additional collections and their
-items are persisted.
+items are persisted. Collection labels are writable and persistent. Deleted
+objects are unregistered and no longer accept requests.
 
 ### org.freedesktop.Secret.Item
 
@@ -132,10 +139,12 @@ unlocked, and use an eligible user session class. The caller process session is
 preferred. If that session is not eligible, exactly one eligible session for the
 UID must exist. Ambiguous selection fails closed.
 
-The trustd request has a two-second timeout. A verifyd request has a 125-second
+The trustd request has a two-second timeout. A verifyd request has a 610-second
 timeout. After verifyd reports success, trustd may be queried for up to two
 seconds while the verification event is recorded. The complete operation has a
-130-second deadline.
+615-second suspend-aware deadline, covering verifyd's configurable maximum
+verification interval. The deadline is checked again before releasing protected
+items, independently of timer dispatch order.
 
 The request is canceled if its D-Bus owner disappears. It also fails if the
 collection locks, the item is removed or changes policy, the transport session
@@ -160,6 +169,9 @@ An item carrying any `platformd.*` attribute is protected against mutation.
 `SetSecret`, `Attributes` and `Label` changes, `Delete`, replace-on-create, and
 collection deletion require the current item policy to be satisfied. Mutation
 does not invoke verifyd. A failed or unavailable trustd query denies the mutation.
+Queries are asynchronous, subject-bound, and limited to two seconds overall.
+Repeated policies are evaluated once. Before committing, the daemon checks the
+request owner, session, lock state, and store revision again.
 
 `platformd.min-grade` accepts:
 
@@ -184,7 +196,10 @@ The effective collection lock is the logical OR of:
 A logind `Lock` request also locks the store immediately. An `Unlock` request
 does not clear the desktop lock; the tracked session must report
 `LockedHint=false`. Invalidation of `LockedHint` treats the session as locked
-until the property is reported again.
+until the property is reported again. Locking cancels pending policy requests,
+verification, and unlock authorization. A known graphical session whose state
+cannot be read remains locked. Without a graphical session, manual locking is
+available independently of logind.
 
 Locked collections reject item creation, replacement, secret and metadata
 changes, item deletion, and collection deletion with
@@ -205,14 +220,27 @@ $XDG_DATA_HOME/platformd-secretd/secrets
 If `XDG_DATA_HOME` is unset, the path is below
 `$HOME/.local/share/platformd-secretd`.
 
-The store has mode 0600. Writes use a temporary file and rename. The daemon
+The store has mode 0600. Writes synchronize the temporary file, rename it, then
+synchronize the containing directory. The daemon
 serializes and writes the complete new state before accepting a mutation. An
 unreadable, malformed, encrypted-without-key, or unsupported store makes the
 daemon read-only so the existing file is not replaced.
+Failure before rename preserves the previous file. Failure to synchronize the
+directory after rename leaves durability uncertain; the mutation is not
+acknowledged and the service exits for recovery from the visible store.
+
+Version 3 persists item paths, collection labels, and aliases. Version 2 stores
+are migrated on load. Item paths in version 2 were not persisted; migration
+assigns new stable identifiers. Applications should rediscover items by
+attributes. Older package versions cannot read version 3. A failed migration
+leaves the service read-only.
 
 The optional `vault-key` systemd credential must be a regular file containing
 exactly 32 bytes. When present, the serialized payload is encrypted with
 AES-256-GCM. Without a configured key, the payload is stored in cleartext.
+An existing plaintext store is migrated before encrypted storage is reported.
+`GetStatus.encrypted` describes the successfully persisted file, not merely a
+loaded key. An empty provider has no encrypted file until its first write.
 The deployment must provide protection through an encrypted home or another
 storage mechanism when cleartext storage is not acceptable.
 
@@ -225,11 +253,21 @@ An inaccessible credential directory, an unreadable or malformed credential,
 or failure to load an explicitly selected key file causes startup to fail.
 No store is created or modified in this case.
 
-Plaintext buffers and the vault key are cleansed after use. The key is locked in
+Owned plaintext buffers, transport keys, and the vault key are cleansed on
+release. Secret-bearing D-Bus messages are marked sensitive. This does not
+establish erasure of copies held by callers or other libraries. The key is locked in
 memory where supported. The service unit disables core dumps and swap for the
 service.
 
 Loss of the vault key makes an encrypted store unrecoverable.
+
+## Resource limits
+
+The provider accepts at most 256 transport sessions and 64 prompts, with limits
+of 16 sessions and 4 prompts per connection. Protected reads and mutations each
+allow 32 pending requests globally and 4 per connection. Bulk requests contain
+at most 4096 paths. Storage permits 65536 items, 4096 additional collections,
+4096 aliases, and 4096 attributes per item.
 
 ## Varlink interface
 

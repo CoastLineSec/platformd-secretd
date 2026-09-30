@@ -102,7 +102,11 @@ static int delayed_policy(sd_event_source *source, uint64_t usec, void *userdata
         PendingReply *pending = userdata;
 
         pending->timer = sd_event_source_unref(pending->timer);
-        (void) reply_policy(pending->link, pending->policy, pending->session, false, "boot-not-verified");
+        bool satisfied = !streq(pending->fake->mode, "bulk-expiry");
+        (void) reply_policy(pending->link, pending->policy, pending->session, satisfied,
+                            !satisfied ? "boot-not-verified" :
+                            streq(pending->policy, "fresh-user-verification") ?
+                            "verification-fresh" : "local-trusted-session");
         pending_free(pending);
         return 0;
 }
@@ -127,6 +131,32 @@ static int evaluate_policy(
                 return sd_varlink_replybo(
                                 link,
                                 SD_JSON_BUILD_PAIR("unexpected", SD_JSON_BUILD_BOOLEAN(true)));
+        if (streq(fake->mode, "wrong-policy"))
+                return reply_policy(link, "unrelated-policy", session, true, "verification-fresh");
+        if (streq(fake->mode, "wrong-session"))
+                return reply_policy(link, policy, "unrelated-session", true, "verification-fresh");
+        if (streq(fake->mode, "wrong-reason"))
+                return reply_policy(link, policy, session, true, "verification-stale");
+        if (streq(fake->mode, "mutation-delay") || streq(fake->mode, "mutation-timeout")) {
+                PendingReply *pending = calloc(1, sizeof *pending);
+
+                if (!pending)
+                        return -ENOMEM;
+                pending->fake = fake;
+                pending->link = sd_varlink_ref(link);
+                pending->policy = strdup(policy);
+                pending->session = strdup(session);
+                pending->next = fake->pending;
+                fake->pending = pending;
+                if (!pending->policy || !pending->session ||
+                    sd_event_add_time_relative(fake->event, &pending->timer, CLOCK_MONOTONIC,
+                                               streq(fake->mode, "mutation-timeout") ? 3000000 : 1500000,
+                                               10000, delayed_policy, pending) < 0) {
+                        pending_free(pending);
+                        return -ENOMEM;
+                }
+                return 1;
+        }
         if (streq(fake->mode, "bulk-expiry")) {
                 uint64_t now;
 

@@ -120,6 +120,14 @@ int main(void) {
 
         send_property(sender, event, &barrier, TEST_SESSION_PATH, SESSION_INTERFACE, PROPERTY_UNLOCKED);
         assert(!collection_locked(&manager));
+        send_property(sender, event, &barrier, TEST_SESSION_PATH, SESSION_INTERFACE, PROPERTY_WRONG_TYPE);
+        assert(collection_locked(&manager));
+        send_property(sender, event, &barrier, TEST_SESSION_PATH, SESSION_INTERFACE, PROPERTY_UNLOCKED);
+        assert(!collection_locked(&manager));
+        send_property(sender, event, &barrier, TEST_SESSION_PATH, SESSION_INTERFACE, PROPERTY_DUPLICATE);
+        assert(collection_locked(&manager));
+        send_property(sender, event, &barrier, TEST_SESSION_PATH, SESSION_INTERFACE, PROPERTY_UNLOCKED);
+        assert(!collection_locked(&manager));
         send_property(sender, event, &barrier, TEST_SESSION_PATH, SESSION_INTERFACE, PROPERTY_LOCKED);
         assert(collection_locked(&manager));
         send_property(sender, event, &barrier, TEST_SESSION_PATH, SESSION_INTERFACE, PROPERTY_UNLOCKED);
@@ -133,6 +141,19 @@ int main(void) {
         send_property(sender, event, &barrier, TEST_SESSION_PATH, SESSION_INTERFACE, PROPERTY_UNLOCKED);
         assert(!manager.desktop_locked);
         assert(collection_locked(&manager));
+
+        manager.manual_locked = false;
+        assert(!collection_locked(&manager));
+        {
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *message = NULL;
+
+                assert(sd_bus_message_new_signal(sender, &message, "/org/freedesktop/login1",
+                                                 "org.freedesktop.login1.Manager", "SessionRemoved") >= 0);
+                assert(sd_bus_message_append(message, "so", "test", TEST_SESSION_PATH) >= 0);
+                dispatch_signal(sender, message, event, &barrier);
+        }
+        assert(collection_locked(&manager));
+        assert(!manager.my_session);
 
         manager.system_bus = sd_bus_flush_close_unref(manager.system_bus);
         free(manager.my_session);

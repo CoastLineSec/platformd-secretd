@@ -275,6 +275,9 @@ int vault_transport_encrypt(const uint8_t key[VAULT_DH_KEY_LEN],
         int len = 0, total = 0, r = -EIO;
 
         *ct_out = NULL;
+        *ct_len = 0;
+        if (pt_len > INT_MAX - VAULT_DH_IV_LEN)
+                return -E2BIG;
         if (vault_random(iv_out, VAULT_DH_IV_LEN) < 0)
                 return -EIO;
         if (!(ctx = EVP_CIPHER_CTX_new()))
@@ -306,6 +309,9 @@ int vault_transport_decrypt(const uint8_t key[VAULT_DH_KEY_LEN],
         int len = 0, total = 0, r = -EBADMSG;
 
         *pt_out = NULL;
+        *pt_len = 0;
+        if (ct_len > INT_MAX)
+                return -E2BIG;
         if (!(ctx = EVP_CIPHER_CTX_new()))
                 return -ENOMEM;
         if (!(*pt_out = malloc(ct_len ? ct_len : 1))) {
@@ -323,6 +329,12 @@ int vault_transport_decrypt(const uint8_t key[VAULT_DH_KEY_LEN],
         r = 0;
 out:
         EVP_CIPHER_CTX_free(ctx);
-        if (r < 0) { free(*pt_out); *pt_out = NULL; }
+        if (r < 0) {
+                if (*pt_out)
+                        vault_wipe(*pt_out, ct_len);
+                free(*pt_out);
+                *pt_out = NULL;
+                *pt_len = 0;
+        }
         return r;
 }
