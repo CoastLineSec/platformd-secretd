@@ -15,7 +15,6 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <syslog.h>
-#include <pwd.h>
 
 #include <systemd/sd-bus.h>
 #include <systemd/sd-daemon.h>
@@ -131,6 +130,7 @@ typedef struct Manager {
         int store_lock_fd;
         sd_bus *system_bus;
         sd_bus_slot *session_query;
+        sd_bus_slot *home_query;
         sd_event_source *system_retry;
         char *my_session;
         sd_varlink_server *varlink;
@@ -4268,37 +4268,57 @@ static int setup_varlink(Manager *mgr, sd_event *event) {
         return 0;
 }
 
-/* Return the systemd-homed storage type for status and diagnostics. */
-static char *query_home_storage(void) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        _cleanup_(sd_bus_error_free) sd_bus_error err = SD_BUS_ERROR_NULL;
+static int on_home_storage(sd_bus_message *reply, void *userdata, sd_bus_error *error) {
+        Manager *manager = userdata;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *record = NULL;
-        struct passwd *pw = getpwuid(getuid());
-        const char *json, *path, *storage = NULL;
+        const char *json, *path, *storage;
         sd_json_variant *binding, *machine, *s;
         char mids[SD_ID128_STRING_MAX];
         sd_id128_t mid;
         int incomplete;
 
-        if (!pw || sd_bus_open_system(&bus) < 0)
-                return NULL;
-        if (sd_bus_call_method(bus, "org.freedesktop.home1", "/org/freedesktop/home1",
-                               "org.freedesktop.home1.Manager", "GetUserRecordByName",
-                               &err, &reply, "s", pw->pw_name) < 0)
-                return NULL;   /* not a homed user, or homed not present */
-        if (sd_bus_message_read(reply, "sbo", &json, &incomplete, &path) < 0 ||
+        manager->home_query = sd_bus_slot_unref(manager->home_query);
+        if (sd_bus_message_is_method_error(reply, NULL) ||
+            sd_bus_message_read(reply, "sbo", &json, &incomplete, &path) <= 0 ||
+            sd_bus_message_at_end(reply, true) <= 0 ||
             sd_json_parse(json, 0, &record, NULL, NULL) < 0 ||
             sd_id128_get_machine(&mid) < 0)
-                return NULL;
+                return 0;
         /* homed keeps the storage backend per-machine, under binding.<machine-id> */
         sd_id128_to_string(mid, mids);
         binding = sd_json_variant_by_key(record, "binding");
         machine = binding ? sd_json_variant_by_key(binding, mids) : NULL;
         s = machine ? sd_json_variant_by_key(machine, "storage") : NULL;
-        if (s && sd_json_variant_is_string(s))
-                storage = sd_json_variant_string(s);
-        return storage ? strdup(storage) : NULL;
+        if (!sd_json_variant_is_string(s))
+                return 0;
+        storage = sd_json_variant_string(s);
+        manager->home_storage = strdup(storage);
+        if (!manager->home_storage)
+                return 0;
+        if (!g_encrypting) {
+                if (streq(storage, "luks") || streq(storage, "fscrypt"))
+                        sd_journal_print(LOG_INFO,
+                                "store kept in the clear on an encrypted home (storage=%s)", storage);
+                else
+                        sd_journal_print(LOG_WARNING,
+                                "secrets at rest are UNENCRYPTED (homed storage=%s, no vault key); "
+                                "set LoadCredentialEncrypted in the unit to protect them", storage);
+        }
+        return 0;
+}
+
+static void query_home_storage(Manager *manager) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *request = NULL;
+
+        if (!manager->system_bus)
+                return;
+        if (sd_bus_message_new_method_call(manager->system_bus, &request,
+                                           "org.freedesktop.home1", "/org/freedesktop/home1",
+                                           "org.freedesktop.home1.Manager", "GetUserRecordByUID") < 0 ||
+            sd_bus_message_append(request, "u", (uint32_t) getuid()) < 0)
+                return;
+        (void) sd_bus_call_async(manager->system_bus, &manager->home_query, request,
+                                 on_home_storage, manager, 2U * 1000000U);
 }
 
 static void manager_clear(Manager *manager) {
@@ -4326,6 +4346,7 @@ static void manager_clear(Manager *manager) {
         free(manager->my_session);
         manager->home_storage = manager->my_session = NULL;
         manager->session_query = sd_bus_slot_unref(manager->session_query);
+        manager->home_query = sd_bus_slot_unref(manager->home_query);
         manager->system_retry = sd_event_source_unref(manager->system_retry);
         manager->system_bus = sd_bus_flush_close_unref(manager->system_bus);
 }
@@ -4402,19 +4423,6 @@ int main(int argc, char **argv) {
                 vault_wipe(g_vault_key, sizeof g_vault_key);
                 return fail("Synchronize migrated store", -EUCLEAN);
         }
-        manager.home_storage = query_home_storage();
-        if (!g_encrypting && manager.home_storage) {
-                if (streq(manager.home_storage, "luks") || streq(manager.home_storage, "fscrypt"))
-                        sd_journal_print(LOG_INFO,
-                                "store kept in the clear on an encrypted home (storage=%s)",
-                                manager.home_storage);
-                else
-                        sd_journal_print(LOG_WARNING,
-                                "secrets at rest are UNENCRYPTED (homed storage=%s, no vault key); "
-                                "set LoadCredentialEncrypted in the unit to protect them",
-                                manager.home_storage);
-        }
-
         if ((r = sd_bus_attach_event(bus, event, SD_EVENT_PRIORITY_NORMAL)) < 0)
                 return fail("attach bus to event loop", r);
         if ((r = sd_bus_match_signal(bus, NULL, "org.freedesktop.DBus",
@@ -4423,6 +4431,7 @@ int main(int argc, char **argv) {
                 return fail("track D-Bus client lifetime", r);
 
         setup_logind_lock(&manager, event);   /* tie lock state to the desktop session */
+        query_home_storage(&manager);
         if ((r = setup_varlink(&manager, event)) < 0) {
                 manager_clear(&manager);
                 vault_wipe(g_vault_key, sizeof g_vault_key);

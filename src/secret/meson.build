@@ -56,6 +56,10 @@ test('integration', find_program('sh'),
      timeout : 60)
 test('lifecycle', find_program('sh'),
      args : [meson.current_source_dir() / 'test-lifecycle.sh', secretd_isolated], timeout : 60)
+home_service_test = executable('test-home-service', 'test-home-service.c', dependencies : libsystemd)
+test('home-storage', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-home-storage.sh', secretd_isolated, home_service_test],
+     timeout : 30)
 test('security', find_program('sh'),
      args : [meson.current_source_dir() / 'test-security.sh', secretd_isolated, security_test],
      timeout : 60)
