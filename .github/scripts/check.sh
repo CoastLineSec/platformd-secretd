@@ -47,8 +47,11 @@ test -f "$check_dir/stage/usr/share/man/man8/platformd-secretd.service.8"
 )
 
 unit=platformd-secretd.service
-sed "s|^ExecStart=.*|ExecStart=$check_dir/stage/usr/libexec/platformd-secretd|" \
-        "$check_dir/build/$unit" > "$check_dir/units/$unit"
+unit_file="$check_dir/stage/usr/lib/systemd/user/$unit"
+test -f "$unit_file"
+[[ $(grep '^ExecStart=' "$unit_file") == 'ExecStart=/usr/libexec/platformd-secretd' ]]
+sed "s|^ExecStart=/usr/libexec/platformd-secretd$|ExecStart=$check_dir/stage/usr/libexec/platformd-secretd|" \
+        "$unit_file" > "$check_dir/units/$unit"
 env -i PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$check_dir/runtime" \
         SYSTEMD_UNIT_PATH="$check_dir/units:/usr/lib/systemd/user" \
         systemd-analyze --user --man=no --generators=no verify "$check_dir/units/$unit"
