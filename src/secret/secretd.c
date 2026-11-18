@@ -2835,19 +2835,14 @@ static int collection_get_label(sd_bus *b, const char *p, const char *i, const c
         return sd_bus_message_append(reply, "s", ((Collection *) userdata)->label ?: "");
 }
 
-static int collection_set_label(sd_bus *bus, const char *path, const char *interface, const char *property,
-                                 sd_bus_message *value, void *userdata, sd_bus_error *error) {
-        Collection *collection = userdata;
+static int collection_update_label(Collection *collection, const char *input, sd_bus_error *error) {
         _cleanup_free_ char *label = NULL;
-        const char *input;
         char *previous;
         uint64_t modified = collection->modified;
         int r;
 
         if (collection_path_locked(manager_instance, collection->path))
                 return sd_bus_error_set(error, "org.freedesktop.Secret.Error.IsLocked", "The collection is locked");
-        if ((r = sd_bus_message_read(value, "s", &input)) < 0)
-                return r;
         label = strdup(input);
         if (!label)
                 return -ENOMEM;
@@ -2861,10 +2856,21 @@ static int collection_set_label(sd_bus *bus, const char *path, const char *inter
         }
         label = NULL;
         free(previous);
-        (void) sd_bus_emit_properties_changed(bus, collection->path, interface, "Label", "Modified", NULL);
-        (void) sd_bus_emit_signal(bus, SECRETS_PATH, "org.freedesktop.Secret.Service",
+        (void) sd_bus_emit_properties_changed(manager_instance->bus, collection->path,
+                                              "org.freedesktop.Secret.Collection", "Label", "Modified", NULL);
+        (void) sd_bus_emit_signal(manager_instance->bus, SECRETS_PATH, "org.freedesktop.Secret.Service",
                                  "CollectionChanged", "o", collection->path);
         return 1;
+}
+
+static int collection_set_label(sd_bus *bus, const char *path, const char *interface, const char *property,
+                                 sd_bus_message *value, void *userdata, sd_bus_error *error) {
+        const char *input;
+        int r;
+
+        if ((r = sd_bus_message_read(value, "s", &input)) < 0)
+                return r;
+        return collection_update_label(userdata, input, error);
 }
 
 static int collection_get_locked(sd_bus *b, const char *p, const char *i, const char *prop,
@@ -3383,12 +3389,16 @@ static int method_create_collection(sd_bus_message *m, void *userdata, sd_bus_er
                         return r;
                 if (streq(prop, "org.freedesktop.Secret.Collection.Label")) {
                         const char *l;
-                        if (sd_bus_message_enter_container(m, 'v', "s") >= 0 &&
-                            sd_bus_message_read(m, "s", &l) >= 0) {
-                                free(label);
-                                label = strdup(l ? l : "");
-                                (void) sd_bus_message_exit_container(m);
-                        }
+                        if (sd_bus_message_enter_container(m, 'v', "s") < 0)
+                                return sd_bus_error_set(e, SD_BUS_ERROR_INVALID_ARGS, "Collection label must be a string");
+                        if ((r = sd_bus_message_read(m, "s", &l)) < 0)
+                                return r;
+                        free(label);
+                        label = strdup(l);
+                        if (!label)
+                                return -ENOMEM;
+                        if ((r = sd_bus_message_exit_container(m)) < 0)
+                                return r;
                 } else if ((r = sd_bus_message_skip(m, "v")) < 0)
                         return r;
                 if ((r = sd_bus_message_exit_container(m)) < 0)
@@ -3401,8 +3411,14 @@ static int method_create_collection(sd_bus_message *m, void *userdata, sd_bus_er
         if (!text_valid(alias, 256))
                 return sd_bus_error_set(e, SD_BUS_ERROR_INVALID_ARGS, "Invalid collection alias");
         Alias *existing_alias = *alias ? alias_find(mgr, alias) : NULL;
-        if (existing_alias)
-                return sd_bus_reply_method_return(m, "oo", existing_alias->collection, "/");
+        if (existing_alias) {
+                c = manager_find_collection(mgr, existing_alias->collection);
+                if (!c)
+                        return sd_bus_error_set(e, SD_BUS_ERROR_UNKNOWN_OBJECT, "The collection no longer exists");
+                if (label && (r = collection_update_label(c, label, e)) < 0)
+                        return r;
+                return sd_bus_reply_method_return(m, "oo", c->path, "/");
+        }
         unsigned collection_count = 0;
         for (Collection *existing = mgr->collections; existing; existing = existing->next)
                 collection_count++;

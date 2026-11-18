@@ -50,6 +50,11 @@ test('vault', executable(
 test('storage', executable('test-storage', 'test-storage.c', 'vault.c', 'policy.c',
      dependencies : [libsystemd, libcrypto],
      link_args : ['-Wl,--wrap=read', '-Wl,--wrap=__read_chk', '-Wl,--wrap=write', '-Wl,--wrap=fsync', '-Wl,--wrap=rename']))
+collection_test = executable('test-collection', 'test-collection.c', 'vault.c', 'policy.c',
+     dependencies : [libsystemd, libcrypto],
+     link_args : ['-Wl,--wrap=write', '-Wl,--wrap=fsync', '-Wl,--wrap=rename'])
+test('collection', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-lock-state.sh', collection_test], timeout : 60)
 security_test = executable('test-security', 'test-security.c', dependencies : libsystemd)
 test('integration', find_program('sh'),
      args : [meson.current_source_dir() / 'test-integration.sh', secretd_isolated],
