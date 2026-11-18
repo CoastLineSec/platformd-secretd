@@ -59,6 +59,7 @@ static void transport_key_clear(void *key) {
 #define SECRETS_PATH    "/org/freedesktop/secrets"
 #define COLLECTION_PATH "/org/freedesktop/secrets/collection/default"
 #define COLLECTION_LABEL "Default"
+#define SESSION_COLLECTION_PATH SECRETS_PATH "/collection/session"
 #define ALIAS_PATH      "/org/freedesktop/secrets/aliases/default"   /* where libsecret looks */
 
 typedef struct Attr {
@@ -131,7 +132,14 @@ typedef struct Manager {
         sd_bus *system_bus;
         sd_bus_slot *session_query;
         sd_bus_slot *home_query;
+        sd_bus_slot *logind_query;
+        sd_event_source *logind_retry;
         sd_event_source *system_retry;
+        sd_login_monitor *login_monitor;
+        sd_event_source *login_event;
+        char **login_sessions;
+        bool login_available;
+        bool logind_available;
         char *my_session;
         sd_varlink_server *varlink;
         char *home_storage;
@@ -160,6 +168,7 @@ static void alias_list_free(Alias *aliases);
 static void alias_remove(Manager *manager, Alias *alias);
 static void mutation_free(Mutation *mutation);
 static void cancel_pending(Manager *manager);
+static void refresh_session_collection(Manager *manager);
 
 static uint8_t g_vault_key[VAULT_KEY_LEN];
 static bool g_encrypting;
@@ -482,6 +491,22 @@ static bool collection_locked(Manager *m) {
         return m->desktop_locked || m->manual_locked;
 }
 
+static bool collection_volatile(const char *path) {
+        return path && streq(path, SESSION_COLLECTION_PATH);
+}
+
+static bool collection_path_locked(Manager *manager, const char *path) {
+        return collection_locked(manager) || (collection_volatile(path) && !manager->login_available);
+}
+
+static int collection_save(const char *path) {
+        if (!collection_volatile(path))
+                return manager_save();
+
+        manager_instance->revision++;
+        return 0;
+}
+
 static bool text_valid(const char *text, size_t max) {
         size_t n;
 
@@ -504,6 +529,78 @@ static bool session_class_allowed(const char *class) {
                 streq(class, "user-early-light"));
 }
 
+static void login_sessions_free(char **sessions) {
+        if (sessions)
+                for (char **s = sessions; *s; s++)
+                        free(*s);
+        free(sessions);
+}
+
+static int login_sessions_read(char ***ret) {
+        char **sessions = NULL, **eligible = NULL;
+        size_t n = 0;
+        int r;
+
+        r = sd_uid_get_sessions(getuid(), 0, &sessions);
+        if (r < 0)
+                return r;
+        eligible = calloc((size_t) r + 1, sizeof(char *));
+        if (!eligible) {
+                login_sessions_free(sessions);
+                return -ENOMEM;
+        }
+        for (size_t i = 0; sessions && sessions[i]; i++) {
+                _cleanup_free_ char *class = NULL, *state = NULL;
+                uid_t uid;
+
+                if (sd_session_get_uid(sessions[i], &uid) < 0 || uid != getuid() ||
+                    sd_session_get_class(sessions[i], &class) < 0) {
+                        login_sessions_free(sessions);
+                        login_sessions_free(eligible);
+                        return -ENODATA;
+                }
+                if (!session_class_allowed(class))
+                        continue;
+                if (sd_session_get_state(sessions[i], &state) < 0) {
+                        login_sessions_free(sessions);
+                        login_sessions_free(eligible);
+                        return -ENODATA;
+                }
+                if (!streq(state, "active") && !streq(state, "online"))
+                        continue;
+                eligible[n] = strdup(sessions[i]);
+                if (!eligible[n]) {
+                        login_sessions_free(sessions);
+                        login_sessions_free(eligible);
+                        return -ENOMEM;
+                }
+                n++;
+        }
+        login_sessions_free(sessions);
+        *ret = eligible;
+        return (int) n;
+}
+
+static bool login_sessions_overlap(char **a, char **b) {
+        for (char **i = a; i && *i; i++)
+                for (char **j = b; j && *j; j++)
+                        if (streq(*i, *j))
+                                return true;
+        return false;
+}
+
+static bool session_collection_current(Manager *manager) {
+        char **sessions = NULL;
+        bool current;
+
+        if (!manager->login_available || !manager->logind_available)
+                return false;
+        current = login_sessions_read(&sessions) > 0 &&
+                  login_sessions_overlap(manager->login_sessions, sessions);
+        login_sessions_free(sessions);
+        return current;
+}
+
 
 static int session_eligible(sd_bus *system_bus, const char *session, uid_t uid) {
         _cleanup_free_ char *class = NULL;
@@ -524,14 +621,6 @@ static int session_eligible(sd_bus *system_bus, const char *session, uid_t uid) 
             !session_class_allowed(class))
                 return 0;
         return 1;
-}
-
-static void string_vector_free(char **strings) {
-        if (!strings)
-                return;
-        for (char **p = strings; *p; p++)
-                free(*p);
-        free(strings);
 }
 
 static int caller_session(sd_bus_message *message, char **ret, uid_t *ret_uid) {
@@ -579,7 +668,7 @@ static int caller_session(sd_bus_message *message, char **ret, uid_t *ret_uid) {
         if (n < 0)
                 return n;
         if (n > 64) {
-                string_vector_free(sessions);
+                login_sessions_free(sessions);
                 return -ENOTUNIQ;
         }
         for (int i = 0; i < n; i++)
@@ -588,12 +677,12 @@ static int caller_session(sd_bus_message *message, char **ret, uid_t *ret_uid) {
                         if (found == 1) {
                                 *ret = strdup(sessions[i]);
                                 if (!*ret) {
-                                        string_vector_free(sessions);
+                                        login_sessions_free(sessions);
                                         return -ENOMEM;
                                 }
                         }
                 }
-        string_vector_free(sessions);
+        login_sessions_free(sessions);
         if (found != 1) {
                 free(*ret);
                 *ret = NULL;
@@ -630,7 +719,8 @@ static GateResult trust_gate_local(Item *item, CallerGrade grade) {
         const char *policy, *mingrade;
         CallerGrade required;
 
-        if (collection_locked(mgr))
+        if (collection_path_locked(mgr, item->collection) ||
+            (collection_volatile(item->collection) && !session_collection_current(mgr)))
                 return GATE_LOCKED;
 
         policy = attr_get(item->attrs, "platformd.policy");
@@ -659,7 +749,8 @@ static bool item_protected(Item *item) {
 static int gate_mutation(Item *item, sd_bus_message *m, sd_bus_error *e) {
         if (item->deleted)
                 return sd_bus_error_set(e, SD_BUS_ERROR_UNKNOWN_OBJECT, "The item no longer exists");
-        if (collection_locked(manager_instance))
+        if (collection_path_locked(manager_instance, item->collection) ||
+            (collection_volatile(item->collection) && !session_collection_current(manager_instance)))
                 return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
                                         "The collection is locked");
         if (!item_protected(item))
@@ -1504,7 +1595,7 @@ static int item_set_secret(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         item->secret_len = store_len;
         item->content_type = new_content_type;
         item->modified = now_secs();
-        if ((r = manager_save()) < 0) {
+        if ((r = collection_save(item->collection)) < 0) {
                 item->secret = old_secret;
                 item->secret_len = old_secret_len;
                 item->content_type = old_content_type;
@@ -1530,7 +1621,7 @@ static int item_delete(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         if ((r = gate_mutation(item, m, e)) < 0)
                 return r;
         item->deleted = true;
-        if ((r = manager_save()) < 0) {
+        if ((r = collection_save(item->collection)) < 0) {
                 item->deleted = false;
                 return persist_error(e, r);
         }
@@ -1542,7 +1633,7 @@ static int item_delete(sd_bus_message *m, void *userdata, sd_bus_error *e) {
 
 static int item_get_locked(sd_bus *b, const char *p, const char *i, const char *prop,
                            sd_bus_message *reply, void *userdata, sd_bus_error *e) {
-        return sd_bus_message_append(reply, "b", manager_instance && collection_locked(manager_instance));
+        return sd_bus_message_append(reply, "b", collection_path_locked(manager_instance, ((Item *) userdata)->collection));
 }
 
 static int item_get_attributes(sd_bus *b, const char *p, const char *i, const char *prop,
@@ -1585,7 +1676,7 @@ static int item_set_label(sd_bus *bus, const char *path, const char *interface, 
         old_modified = item->modified;
         item->label = new_label;
         item->modified = now_secs();
-        if ((r = manager_save()) < 0) {
+        if ((r = collection_save(item->collection)) < 0) {
                 item->label = old_label;
                 item->modified = old_modified;
                 return persist_error(ret_error, r);
@@ -1622,7 +1713,7 @@ static int item_set_attributes(sd_bus *bus, const char *path, const char *interf
         old_modified = item->modified;
         item->attrs = attrs;
         item->modified = now_secs();
-        if ((r = manager_save()) < 0) {
+        if ((r = collection_save(item->collection)) < 0) {
                 item->attrs = old_attrs;
                 item->modified = old_modified;
                 free_attrs(attrs);
@@ -2000,12 +2091,12 @@ static int manager_serialize(Manager *mgr, Buf *out) {
 
         /* collections (the built-in default is always recreated, so skip it). */
         for (Collection *c = mgr->collections; c; c = c->next)
-                if (!streq(c->path, COLLECTION_PATH))
+                if (!streq(c->path, COLLECTION_PATH) && !collection_volatile(c->path))
                         cn++;
         if ((r = buf_u32(out, cn)) < 0)
                 return r;
         for (Collection *c = mgr->collections; c; c = c->next) {
-                if (streq(c->path, COLLECTION_PATH))
+                if (streq(c->path, COLLECTION_PATH) || collection_volatile(c->path))
                         continue;
                 if ((r = buf_str(out, c->path)) < 0 ||
                     (r = buf_str(out, c->label)) < 0 ||
@@ -2021,23 +2112,23 @@ static int manager_serialize(Manager *mgr, Buf *out) {
             (r = buf_u64(out, default_collection->modified)) < 0)
                 return r;
         for (Alias *alias = mgr->aliases; alias; alias = alias->next)
-                if (manager_find_collection(mgr, alias->collection))
+                if (manager_find_collection(mgr, alias->collection) && !collection_volatile(alias->collection))
                         an++;
         if ((r = buf_u32(out, an)) < 0)
                 return r;
         for (Alias *alias = mgr->aliases; alias; alias = alias->next) {
-                if (!manager_find_collection(mgr, alias->collection))
+                if (!manager_find_collection(mgr, alias->collection) || collection_volatile(alias->collection))
                         continue;
                 if ((r = buf_str(out, alias->name)) < 0 || (r = buf_str(out, alias->collection)) < 0)
                         return r;
         }
         for (Item *i = mgr->items; i; i = i->next)
-                if (!i->deleted)
+                if (!i->deleted && !collection_volatile(i->collection))
                         n++;
         if ((r = buf_u32(out, n)) < 0)
                 return r;
         for (Item *i = mgr->items; i; i = i->next) {
-                if (i->deleted)
+                if (i->deleted || collection_volatile(i->collection))
                         continue;
                 uint32_t ac = 0;
                 for (Attr *a = i->attrs; a; a = a->next)
@@ -2154,7 +2245,7 @@ static int manager_deserialize_payload(Manager *mgr, const uint8_t *payload, siz
                 }
                 if (!sd_bus_object_path_is_valid((char *) cpath) ||
                     strncmp((char *) cpath, SECRETS_PATH "/collection/", strlen(SECRETS_PATH "/collection/")) != 0 ||
-                    manager_find_collection(mgr, (char *) cpath)) {
+                    manager_find_collection(mgr, (char *) cpath) || collection_volatile((char *) cpath)) {
                         free(cpath); free(clabel);
                         r = -EBADMSG;
                         goto fail;
@@ -2194,7 +2285,7 @@ static int manager_deserialize_payload(Manager *mgr, const uint8_t *payload, siz
                             (r = rd_string(&p, &collection)) < 0)
                                 goto fail;
                         if (!text_valid(name, 256) || !*name || alias_find(&aliases, name) ||
-                            !manager_find_collection(mgr, collection)) {
+                            !manager_find_collection(mgr, collection) || collection_volatile(collection)) {
                                 r = -EBADMSG;
                                 goto fail;
                         }
@@ -2238,7 +2329,7 @@ static int manager_deserialize_payload(Manager *mgr, const uint8_t *payload, siz
                 it->collection = (char *) coll;
                 it->secret = val;
                 it->secret_len = vl;
-                if (ac > 4096 || !manager_find_collection(mgr, it->collection)) {
+                if (ac > 4096 || !manager_find_collection(mgr, it->collection) || collection_volatile(it->collection)) {
                         item_destroy(mgr, it);
                         r = -EBADMSG;
                         goto fail;
@@ -2433,7 +2524,8 @@ static int collection_create_item(sd_bus_message *m, void *userdata, sd_bus_erro
         size_t store_len;
         Session *sess;
 
-        if (collection_locked(mgr))
+        if (collection_path_locked(mgr, coll->path) ||
+            (collection_volatile(coll->path) && !session_collection_current(mgr)))
                 return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
                                         "The collection is locked");
 
@@ -2559,7 +2651,7 @@ static int collection_create_item(sd_bus_message *m, void *userdata, sd_bus_erro
                 item->content_type = new_content_type;
                 item->modified = now_secs();
 
-                if ((r = manager_save()) < 0) {
+                if ((r = collection_save(coll->path)) < 0) {
                         Attr *failed_attrs = item->attrs;
                         char *failed_label = item->label;
 
@@ -2608,7 +2700,7 @@ static int collection_create_item(sd_bus_message *m, void *userdata, sd_bus_erro
                         goto fail;
                 }
                 created = true;
-                if ((r = manager_save()) < 0) {
+                if ((r = collection_save(coll->path)) < 0) {
                         item_destroy(mgr, item);
                         r = persist_error(e, r);
                         goto fail;
@@ -2670,9 +2762,9 @@ static int collection_delete(sd_bus_message *m, void *userdata, sd_bus_error *e)
         if (collection_locked(mgr))
                 return sd_bus_error_set(e, "org.freedesktop.Secret.Error.IsLocked",
                                         "The collection is locked");
-        if (streq(coll->path, COLLECTION_PATH))
+        if (streq(coll->path, COLLECTION_PATH) || collection_volatile(coll->path))
                 return sd_bus_error_set(e, SD_BUS_ERROR_NOT_SUPPORTED,
-                                        "The default collection cannot be deleted");
+                                        "Built-in collections cannot be deleted");
         /* Refuse collection deletion when a protected item cannot be mutated. */
         for (Item *it = mgr->items; it; it = it->next)
                 if (!it->deleted && it->collection && streq(it->collection, coll->path) &&
@@ -2740,7 +2832,7 @@ static int collection_get_items(sd_bus *b, const char *p, const char *i, const c
 
 static int collection_get_label(sd_bus *b, const char *p, const char *i, const char *prop,
                                 sd_bus_message *reply, void *userdata, sd_bus_error *e) {
-        return sd_bus_message_append(reply, "s", ((Collection *) userdata)->label);
+        return sd_bus_message_append(reply, "s", ((Collection *) userdata)->label ?: "");
 }
 
 static int collection_set_label(sd_bus *bus, const char *path, const char *interface, const char *property,
@@ -2752,7 +2844,7 @@ static int collection_set_label(sd_bus *bus, const char *path, const char *inter
         uint64_t modified = collection->modified;
         int r;
 
-        if (collection_locked(manager_instance))
+        if (collection_path_locked(manager_instance, collection->path))
                 return sd_bus_error_set(error, "org.freedesktop.Secret.Error.IsLocked", "The collection is locked");
         if ((r = sd_bus_message_read(value, "s", &input)) < 0)
                 return r;
@@ -2762,7 +2854,7 @@ static int collection_set_label(sd_bus *bus, const char *path, const char *inter
         previous = collection->label;
         collection->label = label;
         collection->modified = now_secs();
-        if ((r = manager_save()) < 0) {
+        if ((r = collection_save(collection->path)) < 0) {
                 collection->label = previous;
                 collection->modified = modified;
                 return persist_error(error, r);
@@ -2777,7 +2869,7 @@ static int collection_set_label(sd_bus *bus, const char *path, const char *inter
 
 static int collection_get_locked(sd_bus *b, const char *p, const char *i, const char *prop,
                                  sd_bus_message *reply, void *userdata, sd_bus_error *e) {
-        return sd_bus_message_append(reply, "b", collection_locked(manager_instance));
+        return sd_bus_message_append(reply, "b", collection_path_locked(manager_instance, ((Collection *) userdata)->path));
 }
 
 static int collection_get_created(sd_bus *b, const char *p, const char *i, const char *prop,
@@ -3024,6 +3116,7 @@ static int mutation_filter(sd_bus_message *call, void *userdata, sd_bus_error *e
         (void) sd_bus_message_sensitive(call);
         if (!path || !owner)
                 return 0;
+        refresh_session_collection(manager);
         item = manager_find_by_path(manager, path);
         collection = manager_find_collection(manager, path);
         if (item && sd_bus_message_is_method_call(call, "org.freedesktop.Secret.Item", "SetSecret") &&
@@ -3386,15 +3479,17 @@ static int method_search_items(sd_bus_message *m, void *userdata, sd_bus_error *
 /* Build the Lock/Unlock reply: echo the requested object paths as the
  * synchronously handled set (or an empty set when nothing was done), then the
  * prompt path ("/" for none). */
-static int append_known_objects(sd_bus_message *message) {
+static int append_known_objects(sd_bus_message *message, bool locked) {
         Manager *manager = manager_instance;
         int r;
 
         for (Collection *collection = manager->collections; collection; collection = collection->next)
-                if ((r = sd_bus_message_append(message, "o", collection->path)) < 0)
+                if (collection_path_locked(manager, collection->path) == locked &&
+                    (r = sd_bus_message_append(message, "o", collection->path)) < 0)
                         return r;
         for (Item *item = manager->items; item; item = item->next)
-                if (!item->deleted && (r = sd_bus_message_append(message, "o", item->path)) < 0)
+                if (!item->deleted && collection_path_locked(manager, item->collection) == locked &&
+                    (r = sd_bus_message_append(message, "o", item->path)) < 0)
                         return r;
         return 0;
 }
@@ -3430,14 +3525,18 @@ static int reply_lockish(sd_bus_message *m, bool echo, const char *prompt, bool 
                 return r;
         if ((r = sd_bus_message_enter_container(m, 'a', "o")) < 0)
                 return r;
-        while ((r = sd_bus_message_read(m, "o", &p)) > 0)
-                if (echo && !all && (manager_find_collection(manager_instance, p) ||
-                    manager_find_by_path(manager_instance, p)) &&
+        while ((r = sd_bus_message_read(m, "o", &p)) > 0) {
+                Collection *collection = manager_find_collection(manager_instance, p);
+                Item *item = manager_find_by_path(manager_instance, p);
+
+                if (echo && !all && (collection || item) &&
+                    !collection_path_locked(manager_instance, collection ? collection->path : item->collection) &&
                     (r = sd_bus_message_append(reply, "o", p)) < 0)
                         return r;
+        }
         if (r < 0)
                 return r;
-        if (echo && all && (r = append_known_objects(reply)) < 0)
+        if (echo && all && (r = append_known_objects(reply, true)) < 0)
                 return r;
         if ((r = sd_bus_message_exit_container(m)) < 0 ||
             (r = sd_bus_message_close_container(reply)) < 0 ||
@@ -3519,7 +3618,7 @@ static void prompt_complete(Manager *mgr, Prompt *p, bool dismissed, const char 
         if (sd_bus_message_append(sig, "b", dismissed) < 0 ||
             sd_bus_message_open_container(sig, 'v', "ao") < 0 ||
             sd_bus_message_open_container(sig, 'a', "o") < 0 ||
-            (unlocked && append_known_objects(sig) < 0) ||
+            (unlocked && append_known_objects(sig, false) < 0) ||
             sd_bus_message_close_container(sig) < 0 ||
             sd_bus_message_close_container(sig) < 0)
                 return;
@@ -3894,6 +3993,11 @@ static int method_set_alias(sd_bus_message *m, void *userdata, sd_bus_error *e) 
                 return r;
         if (!text_valid(name, 256) || !*name)
                 return sd_bus_error_set(e, SD_BUS_ERROR_INVALID_ARGS, "Invalid collection alias");
+        if (streq(name, "session")) {
+                if (!streq(path, SESSION_COLLECTION_PATH))
+                        return sd_bus_error_set(e, SD_BUS_ERROR_NOT_SUPPORTED, "The session alias cannot be reassigned");
+                return sd_bus_reply_method_return(m, NULL);
+        }
         collection = streq(path, "/") ? NULL : manager_find_collection(manager, path);
         if (!collection && !streq(path, "/"))
                 return sd_bus_error_set(e, SD_BUS_ERROR_UNKNOWN_OBJECT, "No such collection");
@@ -3910,7 +4014,9 @@ static int method_set_alias(sd_bus_message *m, void *userdata, sd_bus_error *e) 
                 alias_remove(manager, alias);
         else
                 return sd_bus_reply_method_return(m, NULL);
-        if ((r = manager_save()) < 0) {
+        if ((r = (!collection || collection_volatile(collection->path)) &&
+                 (!previous || collection_volatile(previous)) ?
+                 collection_save(SESSION_COLLECTION_PATH) : manager_save()) < 0) {
                 if (previous) {
                         if (alias_set(manager, name, previous) < 0)
                                 g_store_readonly = true;
@@ -3964,6 +4070,83 @@ static void set_desktop_locked(Manager *manager, bool locked) {
                 cancel_pending(manager);
         if (was != collection_locked(manager))
                 emit_locked_changed();
+}
+
+static void clear_session_collection(Manager *manager) {
+        Collection *collection = manager_find_collection(manager, SESSION_COLLECTION_PATH);
+
+        cancel_pending(manager);
+        manager->revision++;
+        for (Item *item = manager->items, *next; item; item = next) {
+                next = item->next;
+                if (!collection_volatile(item->collection))
+                        continue;
+                item->deleted = true;
+                emit_item_signal(item->collection, "ItemDeleted", item->path, true);
+                item_destroy(manager, item);
+        }
+        for (Alias *alias = manager->aliases, *next; alias; alias = next) {
+                next = alias->next;
+                if (collection_volatile(alias->collection) && !streq(alias->name, "session"))
+                        alias_remove(manager, alias);
+        }
+        if (collection) {
+                free(collection->label);
+                collection->label = strdup("Session");
+                collection->modified = now_secs();
+                (void) sd_bus_emit_properties_changed(manager->bus, collection->path,
+                                                      "org.freedesktop.Secret.Collection", "Label", "Modified", NULL);
+        }
+}
+
+static void refresh_session_collection(Manager *manager) {
+        char **sessions = NULL;
+        bool available, previous = manager->login_available;
+
+        if (!manager->login_monitor)
+                return;
+        available = manager->logind_available && login_sessions_read(&sessions) > 0;
+        if (previous && (!available || !login_sessions_overlap(manager->login_sessions, sessions)))
+                clear_session_collection(manager);
+        login_sessions_free(manager->login_sessions);
+        manager->login_sessions = sessions;
+        manager->login_available = available;
+        if (previous != available)
+                emit_locked_changed();
+}
+
+static int on_login_change(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
+        Manager *manager = userdata;
+
+        if ((revents & (EPOLLERR | EPOLLHUP)) || sd_login_monitor_flush(manager->login_monitor) < 0) {
+                clear_session_collection(manager);
+                manager->login_available = false;
+                manager->login_event = sd_event_source_unref(manager->login_event);
+                manager->login_monitor = sd_login_monitor_unref(manager->login_monitor);
+                emit_locked_changed();
+                return 0;
+        }
+        refresh_session_collection(manager);
+        return 0;
+}
+
+static void setup_session_collection(Manager *manager, sd_event *event) {
+        int r;
+
+        r = sd_login_monitor_new("session", &manager->login_monitor);
+        if (r >= 0)
+                r = sd_event_add_io(event, &manager->login_event,
+                                    sd_login_monitor_get_fd(manager->login_monitor), EPOLLIN,
+                                    on_login_change, manager);
+        if (r >= 0)
+                r = sd_event_source_set_priority(manager->login_event, SD_EVENT_PRIORITY_IMPORTANT);
+        if (r < 0) {
+                manager->login_event = sd_event_source_unref(manager->login_event);
+                manager->login_monitor = sd_login_monitor_unref(manager->login_monitor);
+                sd_journal_print(LOG_WARNING, "Session collection unavailable: %s", strerror(-r));
+                return;
+        }
+        refresh_session_collection(manager);
 }
 
 static int on_session_state(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -4095,6 +4278,8 @@ static void setup_logind_lock(Manager *manager, sd_event *event);
 static int on_system_bus_lost(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Manager *manager = userdata;
 
+        manager->logind_available = false;
+        refresh_session_collection(manager);
         cancel_pending(manager);
         if (manager->my_session)
                 set_desktop_locked(manager, true);
@@ -4114,6 +4299,12 @@ static int on_logind_owner(sd_bus_message *message, void *userdata, sd_bus_error
         if (sd_bus_message_read(message, "sss", &name, &old_owner, &new_owner) <= 0 ||
             !streq(name, "org.freedesktop.login1") || streq(old_owner, new_owner))
                 return 0;
+        manager->logind_query = sd_bus_slot_unref(manager->logind_query);
+        manager->logind_retry = sd_event_source_unref(manager->logind_retry);
+        manager->logind_available = false;
+        refresh_session_collection(manager);
+        manager->logind_available = *new_owner;
+        refresh_session_collection(manager);
         cancel_pending(manager);
         if (manager->my_session)
                 set_desktop_locked(manager, true);
@@ -4131,6 +4322,50 @@ static int on_system_retry(sd_event_source *source, uint64_t usec, void *userdat
         manager->system_retry = sd_event_source_unref(manager->system_retry);
         setup_logind_lock(manager, sd_bus_get_event(manager->bus));
         return 0;
+}
+
+static void query_logind_owner(Manager *manager);
+
+static int on_logind_retry(sd_event_source *source, uint64_t usec, void *userdata) {
+        Manager *manager = userdata;
+
+        manager->logind_retry = sd_event_source_unref(manager->logind_retry);
+        query_logind_owner(manager);
+        return 0;
+}
+
+static void schedule_logind_retry(Manager *manager) {
+        if (!manager->logind_retry)
+                (void) sd_event_add_time_relative(sd_bus_get_event(manager->bus), &manager->logind_retry,
+                                                  CLOCK_BOOTTIME, 5U * 1000000U, 0,
+                                                  on_logind_retry, manager);
+}
+
+static int on_logind_query(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Manager *manager = userdata;
+        const char *owner;
+
+        manager->logind_query = sd_bus_slot_unref(manager->logind_query);
+        manager->logind_available = !sd_bus_message_is_method_error(message, NULL) &&
+                                   sd_bus_message_read(message, "s", &owner) > 0 &&
+                                   owner[0] == ':' && sd_bus_service_name_is_valid(owner) &&
+                                   sd_bus_message_at_end(message, true) > 0;
+        refresh_session_collection(manager);
+        if (!manager->logind_available)
+                schedule_logind_retry(manager);
+        return 0;
+}
+
+static void query_logind_owner(Manager *manager) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *request = NULL;
+
+        if (sd_bus_message_new_method_call(manager->system_bus, &request,
+                                           "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                           "org.freedesktop.DBus", "GetNameOwner") < 0 ||
+            sd_bus_message_append(request, "s", "org.freedesktop.login1") < 0 ||
+            sd_bus_call_async(manager->system_bus, &manager->logind_query, request,
+                              on_logind_query, manager, 2U * 1000000U) < 0)
+                schedule_logind_retry(manager);
 }
 
 static void setup_logind_lock(Manager *manager, sd_event *event) {
@@ -4170,10 +4405,13 @@ static void setup_logind_lock(Manager *manager, sd_event *event) {
                 goto fail;
         free(manager->my_session);
         manager->my_session = NULL;
+        query_logind_owner(manager);
         resolve_my_session(manager);
         return;
 fail:
         manager->system_bus = sd_bus_flush_close_unref(manager->system_bus);
+        manager->logind_available = false;
+        refresh_session_collection(manager);
         resolve_my_session(manager);
         (void) sd_event_add_time(event, &manager->system_retry, CLOCK_BOOTTIME,
                                 now_boottime_usec() + 5000000, 0, on_system_retry, manager);
@@ -4369,7 +4607,13 @@ static void manager_clear(Manager *manager) {
         manager->home_storage = manager->my_session = NULL;
         manager->session_query = sd_bus_slot_unref(manager->session_query);
         manager->home_query = sd_bus_slot_unref(manager->home_query);
+        manager->logind_query = sd_bus_slot_unref(manager->logind_query);
+        manager->logind_retry = sd_event_source_unref(manager->logind_retry);
         manager->system_retry = sd_event_source_unref(manager->system_retry);
+        manager->login_event = sd_event_source_unref(manager->login_event);
+        manager->login_monitor = sd_login_monitor_unref(manager->login_monitor);
+        login_sessions_free(manager->login_sessions);
+        manager->login_sessions = NULL;
         manager->system_bus = sd_bus_flush_close_unref(manager->system_bus);
 }
 
@@ -4445,6 +4689,14 @@ int main(int argc, char **argv) {
                 vault_wipe(g_vault_key, sizeof g_vault_key);
                 return fail("Synchronize migrated store", -EUCLEAN);
         }
+        Collection *session_collection = collection_new(&manager, SESSION_COLLECTION_PATH, "Session");
+        if (!session_collection)
+                return fail("Create session collection", -ENOMEM);
+        if ((r = sd_bus_add_object_vtable(bus, &session_collection->slot, SESSION_COLLECTION_PATH,
+                                          "org.freedesktop.Secret.Collection", collection_vtable,
+                                          session_collection)) < 0 ||
+            (r = alias_set(&manager, "session", SESSION_COLLECTION_PATH)) < 0)
+                return fail("Register session collection", r);
         if ((r = sd_bus_attach_event(bus, event, SD_EVENT_PRIORITY_NORMAL)) < 0)
                 return fail("attach bus to event loop", r);
         if ((r = sd_bus_match_signal(bus, NULL, "org.freedesktop.DBus",
@@ -4453,6 +4705,7 @@ int main(int argc, char **argv) {
                 return fail("track D-Bus client lifetime", r);
 
         setup_logind_lock(&manager, event);   /* tie lock state to the desktop session */
+        setup_session_collection(&manager, event);
         query_home_storage(&manager);
         if ((r = setup_varlink(&manager, event)) < 0) {
                 manager_clear(&manager);

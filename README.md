@@ -2,8 +2,8 @@
 
 platformd-secretd is a Secret Service provider for Linux user sessions. It
 implements `org.freedesktop.secrets` and is compatible with libsecret clients.
-The daemon stores collections and items, tracks the logind lock state, and may
-apply platform authentication policy to individual items.
+The daemon provides persistent and session collections, tracks the logind lock
+state, and may apply platform authentication policy to individual items.
 
 The `platformd.policy` item attribute accepts:
 
@@ -26,6 +26,7 @@ and retrieve secrets.
 - libsystemd 257 or newer
 - OpenSSL 3.0 or newer
 - Meson 1.1 or newer
+- libsecret for tests
 - polkit for interactive collection unlock
 - platformd-trustd and platformd-verifyd for protected items
 
@@ -45,8 +46,10 @@ platformd-secretd after disabling any other Secret Service provider:
 systemctl --user enable --now platformd-secretd.service
 ```
 
-Collections share one lock state. Persistent stores are upgraded to version 3
-when loaded; earlier package versions cannot read the upgraded format.
+Collections share one lock state. The session collection is kept in memory and
+cleared when the last ordinary login session ends. Persistent stores are
+upgraded to version 3 when loaded; earlier package versions cannot read the
+upgraded format.
 
 See [docs/secret-service.md](docs/secret-service.md) and the
 `platformd-secretd.service(8)` and `secretctl(1)` manual pages.

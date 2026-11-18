@@ -97,6 +97,24 @@ test('lock-state', find_program('sh'),
      args : [meson.current_source_dir() / 'test-lock-state.sh', lock_state_test],
      timeout : 60)
 
+session_collection_test = executable('test-session-collection', 'test-session-collection.c', 'vault.c', 'policy.c',
+     dependencies : [libsystemd, libcrypto])
+test('session-collection', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-lock-state.sh', session_collection_test],
+     timeout : 60)
+
+session_daemon_test = executable('platformd-secretd-session-test',
+     'secretd.c', 'vault.c', 'policy.c', 'test-session.c', 'test-login.c',
+     link_args : ['-Wl,--wrap=sd_uid_get_display', '-Wl,--wrap=sd_uid_get_sessions',
+                  '-Wl,--wrap=sd_session_get_uid', '-Wl,--wrap=sd_session_get_class',
+                  '-Wl,--wrap=sd_session_get_state', '-Wl,--wrap=sd_bus_request_name'],
+     dependencies : [libsystemd, libcrypto])
+session_client_test = executable('test-session-client', 'test-session-client.c',
+     dependencies : dependency('libsecret-1'))
+test('session-client', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-session-collection.sh', session_daemon_test, session_client_test],
+     timeout : 60)
+
 stepup_test = executable('test-stepup', 'test-stepup.c', 'vault.c', 'policy.c',
      dependencies : [libsystemd, libcrypto])
 test('stepup', find_program('sh'),

@@ -11,6 +11,7 @@ The daemon provides:
 - the standard Service, Collection, Item, Session, and Prompt interfaces
 - plain and `dh-ietf1024-sha256-aes128-cbc-pkcs7` transport sessions
 - persistent collections and items
+- a volatile session collection
 - optional AES-256-GCM encryption for the store
 - collection lock state derived from logind and explicit Service.Lock requests
 - per-item release policy evaluated by platformd-trustd
@@ -28,6 +29,8 @@ The service uses this object hierarchy:
 /org/freedesktop/secrets
 /org/freedesktop/secrets/collection/default
 /org/freedesktop/secrets/aliases/default
+/org/freedesktop/secrets/collection/session
+/org/freedesktop/secrets/aliases/session
 /org/freedesktop/secrets/collection/cN
 /org/freedesktop/secrets/collection/cN/iID
 /org/freedesktop/secrets/session/N
@@ -35,8 +38,32 @@ The service uses this object hierarchy:
 ```
 
 The `default` alias initially names the default collection. Aliases can be
-assigned or removed with `SetAlias` and persist across restarts. An alias path
-exports the same Collection interface as its canonical target.
+assigned or removed with `SetAlias`. Aliases to persistent collections persist
+across restarts. The `session` alias is reserved for the volatile session
+collection and cannot be reassigned. An alias path exports the same Collection
+interface as its canonical target.
+
+### Session collection
+
+The `session` collection implements `SECRET_COLLECTION_SESSION`. Its items,
+labels, and aliases are held in memory and are not included in the persistent
+store. Mutations do not write the store and remain available when persistent
+storage is read-only. Secret Service transport sessions remain connection-bound
+and do not determine the collection lifetime.
+
+The collection is shared by the UID's ordinary logind sessions. Sessions of
+class `user`, `user-early`, `user-light`, or `user-early-light` in state `active`
+or `online` retain the collection. Closing sessions, greeters, and lingering
+user managers do not. The last eligible session ending clears all items and
+additional aliases. A new session set with no surviving session from the
+previous set also clears the collection.
+
+Daemon restart, loss of the logind bus owner, unavailable session state, and
+monitor failure clear session secrets. The collection is unavailable until
+logind ownership and an eligible login session are established. Recovery from a
+failed session monitor requires a daemon restart. Persistent collections do not
+require session collection availability. Existing collection locks and per-item
+release policies apply to session items.
 
 ### org.freedesktop.Secret.Service
 
@@ -83,9 +110,10 @@ Collections implement:
 - `Created`
 - `Modified`
 
-The default collection cannot be deleted. Additional collections and their
-items are persisted. Collection labels are writable and persistent. Deleted
-objects are unregistered and no longer accept requests.
+The default and session collections cannot be deleted. Additional collections
+and their items are persisted. Collection labels are writable; the session
+collection label is not persisted. Deleted objects are unregistered and no
+longer accept requests.
 
 ### org.freedesktop.Secret.Item
 
