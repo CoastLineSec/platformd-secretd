@@ -60,6 +60,9 @@ home_service_test = executable('test-home-service', 'test-home-service.c', depen
 test('home-storage', find_program('sh'),
      args : [meson.current_source_dir() / 'test-home-storage.sh', secretd_isolated, home_service_test],
      timeout : 30)
+cli_service_test = executable('test-cli-service', 'test-cli-service.c', dependencies : libsystemd)
+test('cli', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-cli.sh', secretctl, cli_service_test], timeout : 60)
 test('security', find_program('sh'),
      args : [meson.current_source_dir() / 'test-security.sh', secretd_isolated, security_test],
      timeout : 60)

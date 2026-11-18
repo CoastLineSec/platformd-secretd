@@ -2,10 +2,12 @@
 /* Command-line client for platformd-secretd. */
 
 #include <stdbool.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <systemd/sd-bus.h>
@@ -217,16 +219,54 @@ static int cmd_list(void) {
         return EXIT_SUCCESS;
 }
 
-struct prompt_wait { int done; int dismissed; };
+static int read_handled_objects(sd_bus_message *message) {
+        const char *path;
+        unsigned count = 0;
+        bool handled = false;
+        int r;
+
+        if ((r = sd_bus_message_enter_container(message, 'a', "o")) <= 0)
+                return r < 0 ? r : -EBADMSG;
+        while ((r = sd_bus_message_read(message, "o", &path)) > 0) {
+                if (++count > 65536U + 4097U)
+                        return -E2BIG;
+                handled |= streq(path, COLL_PATH);
+        }
+        if (r < 0 || (r = sd_bus_message_exit_container(message)) < 0)
+                return r;
+        return handled;
+}
+
+static uint64_t deadline_remaining(uint64_t deadline) {
+        struct timespec now;
+        uint64_t usec;
+
+        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+                return 0;
+        usec = (uint64_t) now.tv_sec * 1000000U + now.tv_nsec / 1000U;
+        return usec < deadline ? deadline - usec : 0;
+}
+
+static int call_before(sd_bus *bus, sd_bus_message *request, uint64_t deadline,
+                       sd_bus_error *error, sd_bus_message **reply) {
+        uint64_t remaining = deadline_remaining(deadline);
+
+        return remaining > 0 ? sd_bus_call(bus, request, remaining, error, reply) : -ETIMEDOUT;
+}
+
+struct prompt_wait { bool done; int dismissed; int handled; };
 
 static int on_prompt_completed(sd_bus_message *m, void *userdata, sd_bus_error *e) {
         struct prompt_wait *w = userdata;
-        int dismissed = 0;
 
-        if (sd_bus_message_read(m, "b", &dismissed) >= 0) {
-                w->dismissed = dismissed;
-                w->done = 1;
-        }
+        w->done = true;
+        w->handled = -EBADMSG;
+        if (sd_bus_message_read(m, "b", &w->dismissed) <= 0 ||
+            sd_bus_message_enter_container(m, 'v', "ao") <= 0)
+                return 0;
+        w->handled = read_handled_objects(m);
+        if (sd_bus_message_exit_container(m) < 0 || sd_bus_message_at_end(m, true) <= 0)
+                w->handled = -EBADMSG;
         return 0;
 }
 
@@ -234,7 +274,9 @@ static int lock_or_unlock(const char *method) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *req = NULL, *reply = NULL;
-        int r;
+        struct timespec now;
+        uint64_t deadline;
+        int r, handled, locked;
 
         if (sd_bus_open_user(&bus) < 0) {
                 fprintf(stderr, "secretctl: cannot connect to the session bus\n");
@@ -244,38 +286,47 @@ static int lock_or_unlock(const char *method) {
                 fprintf(stderr, "secretctl: no Secret Service provider is running\n");
                 return EXIT_FAILURE;
         }
+        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+                return EXIT_FAILURE;
+        deadline = (uint64_t) now.tv_sec * 1000000U + now.tv_nsec / 1000U + 130U * 1000000U;
         r = sd_bus_message_new_method_call(bus, &req, SECRETS_NAME, SVC_PATH, IF_SVC, method);
         if (r < 0 ||
             sd_bus_message_open_container(req, 'a', "o") < 0 ||
             sd_bus_message_append(req, "o", COLL_PATH) < 0 ||
             sd_bus_message_close_container(req) < 0)
                 return EXIT_FAILURE;
-        if (sd_bus_call(bus, req, 0, &error, &reply) < 0) {
+        if (call_before(bus, req, deadline, &error, &reply) < 0) {
                 fprintf(stderr, "secretctl: %s\n", error.message ? error.message : "call failed");
                 return EXIT_FAILURE;
         }
 
-        /* Reply is (ao handled, o prompt). If a prompt is required, drive it:
-         * subscribe Completed, call Prompt, wait for the re-authentication. */
-        const char *prompt = "/";
-        if (sd_bus_message_skip(reply, "ao") >= 0)
-                (void) sd_bus_message_read(reply, "o", &prompt);
-        if (prompt && !streq(prompt, "/")) {
-                struct prompt_wait w = { 0, 0 };
+        const char *prompt;
+        handled = read_handled_objects(reply);
+        if (handled < 0 || sd_bus_message_read(reply, "o", &prompt) <= 0 ||
+            sd_bus_message_at_end(reply, true) <= 0) {
+                fprintf(stderr, "secretctl: invalid lock operation reply\n");
+                return EXIT_FAILURE;
+        }
+        if (!streq(prompt, "/")) {
+                struct prompt_wait w = {};
                 _cleanup_(sd_bus_slot_unrefp) sd_bus_slot *slot = NULL;
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *preq = NULL, *prep = NULL;
 
-                (void) sd_bus_match_signal(bus, &slot, SECRETS_NAME, prompt, IF_PROMPT,
-                                           "Completed", on_prompt_completed, &w);
-                if (sd_bus_message_new_method_call(bus, &preq, SECRETS_NAME, prompt, IF_PROMPT, "Prompt") < 0 ||
+                uint64_t remaining = deadline_remaining(deadline);
+                if (remaining == 0 || sd_bus_set_method_call_timeout(bus, remaining) < 0 ||
+                    sd_bus_match_signal(bus, &slot, SECRETS_NAME, prompt, IF_PROMPT,
+                                         "Completed", on_prompt_completed, &w) < 0 ||
+                    sd_bus_message_new_method_call(bus, &preq, SECRETS_NAME, prompt, IF_PROMPT, "Prompt") < 0 ||
                     sd_bus_message_append(preq, "s", "") < 0 ||
-                    sd_bus_call(bus, preq, 130ULL * 1000000, &error, &prep) < 0) {
+                    call_before(bus, preq, deadline, &error, &prep) < 0) {
                         fprintf(stderr, "secretctl: %s\n", error.message ? error.message : "prompt failed");
                         return EXIT_FAILURE;
                 }
-                for (int i = 0; !w.done && i < 2600; i++)
-                        if (sd_bus_process(bus, NULL) <= 0)
-                                (void) sd_bus_wait(bus, 50000);
+                while (!w.done && (remaining = deadline_remaining(deadline)) > 0) {
+                        r = sd_bus_process(bus, NULL);
+                        if (r < 0 || (r == 0 && sd_bus_wait(bus, remaining) < 0))
+                                break;
+                }
                 if (!w.done) {
                         fprintf(stderr, "secretctl: unlock prompt timed out\n");
                         return EXIT_FAILURE;
@@ -284,8 +335,29 @@ static int lock_or_unlock(const char *method) {
                         fprintf(stderr, "secretctl: unlock declined\n");
                         return EXIT_FAILURE;
                 }
-                printf("default collection unlocked\n");
-                return EXIT_SUCCESS;
+                if (w.handled < 0) {
+                        fprintf(stderr, "secretctl: invalid prompt completion result\n");
+                        return EXIT_FAILURE;
+                }
+                handled |= w.handled;
+        }
+        if (!handled) {
+                fprintf(stderr, "secretctl: the default collection was not %sed\n",
+                        streq(method, "Lock") ? "lock" : "unlock");
+                return EXIT_FAILURE;
+        }
+        req = sd_bus_message_unref(req);
+        reply = sd_bus_message_unref(reply);
+        if (sd_bus_message_new_method_call(bus, &req, SECRETS_NAME, COLL_PATH,
+                                           "org.freedesktop.DBus.Properties", "Get") < 0 ||
+            sd_bus_message_append(req, "ss", IF_COLL, "Locked") < 0 ||
+            call_before(bus, req, deadline, &error, &reply) < 0 ||
+            sd_bus_message_enter_container(reply, 'v', "b") <= 0 ||
+            sd_bus_message_read(reply, "b", &locked) <= 0 ||
+            sd_bus_message_exit_container(reply) < 0 || sd_bus_message_at_end(reply, true) <= 0 ||
+            !!locked != streq(method, "Lock")) {
+                fprintf(stderr, "secretctl: the requested collection lock state was not confirmed\n");
+                return EXIT_FAILURE;
         }
         printf("default collection %sed\n", streq(method, "Lock") ? "lock" : "unlock");
         return EXIT_SUCCESS;
