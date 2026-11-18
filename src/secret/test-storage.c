@@ -9,9 +9,18 @@
 
 static unsigned fault;
 
+ssize_t __real_read(int fd, void *data, size_t size);
 ssize_t __real_write(int fd, const void *data, size_t size);
 int __real_fsync(int fd);
 int __real_rename(const char *from, const char *to);
+
+ssize_t __wrap_read(int fd, void *data, size_t size) {
+        if (fault == 5) {
+                errno = EIO;
+                return -1;
+        }
+        return __real_read(fd, data, size);
+}
 
 ssize_t __wrap_write(int fd, const void *data, size_t size) {
         if (fault == 1) {
@@ -65,6 +74,98 @@ static void test_duplicate_attributes(void) {
         free(payload.data);
 }
 
+static void test_persistence_status(void) {
+        char directory[] = "/tmp/platformd-storage-status.XXXXXX";
+        _cleanup_free_ char *path = NULL;
+        Manager manager = {};
+
+        assert(mkdtemp(directory));
+        assert(setenv("XDG_DATA_HOME", directory, 1) == 0);
+        assert(collection_new(&manager, COLLECTION_PATH, "test"));
+        manager_instance = &manager;
+        assert(store_path(&path) == 0);
+
+        for (unsigned phase = 1; phase <= 4; phase++) {
+                g_store_loaded = true;
+                g_store_readonly = false;
+                g_store_uncertain = false;
+                g_store_error = 0;
+                fault = phase;
+                assert(manager_save() == (phase == 4 ? -EUCLEAN : -EIO));
+                assert(g_store_loaded);
+                assert(g_store_error == (phase == 4 ? EUCLEAN : EIO));
+                assert(g_store_readonly == (phase == 4));
+                assert(g_store_uncertain == (phase == 4));
+                fault = 0;
+                if (phase == 4) {
+                        assert(manager_save() == -EROFS);
+                        assert(g_store_error == EUCLEAN);
+                } else {
+                        assert(manager_save() == 0);
+                        assert(g_store_error == 0);
+                }
+        }
+
+        manager_instance = NULL;
+        collection_destroy(&manager, manager.collections);
+        assert(unlink(path) == 0);
+        *strrchr(path, '/') = 0;
+        assert(rmdir(path) == 0);
+        assert(rmdir(directory) == 0);
+}
+
+static void test_load_status(void) {
+        char directory[] = "/tmp/platformd-storage-load.XXXXXX";
+        _cleanup_free_ char *path = NULL;
+        _cleanup_(sensitive_buffer_clear) SensitiveBuffer before = {}, after = {};
+        Manager manager = {};
+
+        assert(mkdtemp(directory));
+        assert(setenv("XDG_DATA_HOME", directory, 1) == 0);
+        assert(collection_new(&manager, COLLECTION_PATH, "persisted"));
+        manager_instance = &manager;
+        fault = 0;
+        g_store_readonly = g_store_uncertain = false;
+        assert(manager_save() == 0);
+        assert(store_path(&path) == 0);
+        assert(read_file(path, &before.data, &before.size) == 0);
+        collection_destroy(&manager, manager.collections);
+        assert(collection_new(&manager, COLLECTION_PATH, "initial"));
+
+        g_store_loaded = false;
+        fault = 5;
+        manager_load(&manager);
+        assert(!g_store_loaded);
+        assert(g_store_readonly);
+        assert(g_store_error == EIO);
+        assert(streq(manager.collections->label, "initial"));
+        assert(manager_save() == -EROFS);
+        assert(g_store_error == EIO);
+
+        g_store_readonly = false;
+        g_store_error = 0;
+        g_encrypting = true;
+        fault = 1;
+        manager_load(&manager);
+        assert(g_store_loaded);
+        assert(g_store_readonly);
+        assert(!g_store_encrypted);
+        assert(g_store_error == EIO);
+        assert(streq(manager.collections->label, "persisted"));
+        assert(manager_save() == -EROFS);
+        assert(g_store_error == EIO);
+        fault = 0;
+        assert(read_file(path, &after.data, &after.size) == 0);
+        assert(before.size == after.size && memcmp(before.data, after.data, before.size) == 0);
+
+        manager_instance = NULL;
+        collection_destroy(&manager, manager.collections);
+        assert(unlink(path) == 0);
+        *strrchr(path, '/') = 0;
+        assert(rmdir(path) == 0);
+        assert(rmdir(directory) == 0);
+}
+
 int main(void) {
         char directory[] = "/tmp/platformd-storage.XXXXXX", path[sizeof directory + 16];
 
@@ -88,5 +189,7 @@ int main(void) {
         assert(unlink(path) == 0);
         assert(rmdir(directory) == 0);
         test_duplicate_attributes();
+        test_persistence_status();
+        test_load_status();
         return 0;
 }

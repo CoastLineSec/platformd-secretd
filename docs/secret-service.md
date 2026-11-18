@@ -239,8 +239,9 @@ The optional `vault-key` systemd credential must be a regular file containing
 exactly 32 bytes. When present, the serialized payload is encrypted with
 AES-256-GCM. Without a configured key, the payload is stored in cleartext.
 An existing plaintext store is migrated before encrypted storage is reported.
-`GetStatus.encrypted` describes the successfully persisted file, not merely a
-loaded key. An empty provider has no encrypted file until its first write.
+`GetStatus.encrypted` describes the successfully loaded or persisted file, not
+merely a loaded key. It does not identify the cipher of an unreadable store.
+An empty provider has no encrypted file until its first write.
 The deployment must provide protection through an encrypted home or another
 storage mechanism when cleartext storage is not acceptable.
 
@@ -282,8 +283,23 @@ $XDG_RUNTIME_DIR/platformd-secretd/io.platformd.Secret
 - effective, desktop, and manual lock state
 - item count
 - store encryption state
+- store load state, write availability, and recorded persistence error
 - tracked session identifier
 - detected home storage type
+
+`storeLoaded` is true after the store was loaded successfully, or if no store
+existed at startup. A failed migration preserves readable loaded items.
+`storeReadOnly` is true when the daemon has disabled persistence, including
+after a failed load or migration, or uncertain post-rename durability.
+`storeDegraded` is true while writes are disabled, durability is uncertain, or
+a persistence attempt has failed. `storeError` contains the positive Linux
+errno from the failed load or most recent persistence attempt, or zero when
+no failure is recorded. A successful persistence attempt clears that error.
+Rejected writes while persistence is disabled retain the original error.
+
+These fields describe recorded daemon state. `GetStatus()` does not probe the
+store, permissions, available space, or filesystem health. In particular,
+`storeReadOnly` being false does not guarantee that the next write will succeed.
 
 `ListItems()` returns labels, attributes, and timestamps. It never returns
 secret values.

@@ -164,8 +164,10 @@ static void cancel_pending(Manager *manager);
 static uint8_t g_vault_key[VAULT_KEY_LEN];
 static bool g_encrypting;
 static bool g_store_encrypted;
+static bool g_store_loaded;
 static bool g_store_readonly;
 static bool g_store_uncertain;
+static int g_store_error;
 
 static int fail(const char *what, int r) {
         sd_journal_print(LOG_ERR, "%s: %s", what, strerror(-r));
@@ -2054,13 +2056,13 @@ static int manager_save(void) {
 
         if (!mgr)
                 return -ENXIO;
-        if ((r = store_path(&path)) < 0)
-                return r;
-        if (g_store_readonly) {   /* refuse to clobber an unreadable store */
+        if (g_store_readonly) {
                 sd_journal_print(LOG_ERR,
-                                 "refusing to save: the existing store could not be read");
+                                 "Refusing to save: persistence is disabled");
                 return -EROFS;
         }
+        if ((r = store_path(&path)) < 0)
+                goto out;
         if ((r = manager_serialize(mgr, &payload)) < 0)
                 goto out;
         if ((r = buf_append(&file, "PLTFSECR", 8)) < 0 ||
@@ -2089,11 +2091,13 @@ static int manager_save(void) {
                         goto out;
         }
         r = write_atomic(path, file.data, file.len, 0600);
-        if (r >= 0)
+        if (r >= 0) {
                 g_store_encrypted = g_encrypting;
-        if (r >= 0)
+                g_store_loaded = true;
                 mgr->revision++;
+        }
 out:
+        g_store_error = r < 0 ? -r : 0;
         if (ct) {
                 vault_wipe(ct, payload.len);
                 free(ct);
@@ -2297,16 +2301,16 @@ static void manager_load(Manager *mgr) {
 
         if ((e = store_path(&path)) < 0) {
                 sd_journal_print(LOG_ERR, "cannot determine the secret store path: %s", strerror(-e));
-                g_store_readonly = true;
-                return;
+                goto fail;
         }
         if ((e = read_file(path, &store.data, &store.size)) < 0) {
-                if (e == -ENOENT)
+                if (e == -ENOENT) {
+                        g_store_loaded = true;
                         return;   /* no store yet */
+                }
                 sd_journal_print(LOG_ERR, "cannot read secret store %s: %s; writes disabled",
                                  path, strerror(-e));
-                g_store_readonly = true;
-                return;
+                goto fail;
         }
 
         Rd r = { store.data, store.size, 0 };
@@ -2316,14 +2320,14 @@ static void manager_load(Manager *mgr) {
                 /* Serve no items from a foreign or newer on-disk version, but do not
                  * overwrite what we could not read. */
                 sd_journal_print(LOG_ERR, "unrecognized store %s, writes disabled to protect it", path);
-                g_store_readonly = true;
-                return;
+                e = -EBADMSG;
+                goto fail;
         }
 
         if (cipher == 0) {
                 if (rd_u32(&r, &plen) < 0 || r.pos + plen != store.size) {
-                        g_store_readonly = true;   /* do not overwrite malformed input */
-                        return;
+                        e = -EBADMSG;
+                        goto fail;
                 }
                 e = manager_deserialize_payload(mgr, store.data + r.pos, plen, version);
         } else if (cipher == 1) {
@@ -2333,45 +2337,48 @@ static void manager_load(Manager *mgr) {
                 if (!g_encrypting) {
                         sd_journal_print(LOG_ERR, "store is encrypted but no vault key is loaded; "
                                          "serving empty; writes are disabled to protect it");
-                        g_store_readonly = true;
-                        return;
+                        e = -ENOKEY;
+                        goto fail;
                 }
                 if (rd_raw(&r, nonce, sizeof nonce) < 0 || rd_raw(&r, tag, sizeof tag) < 0 ||
                     rd_u32(&r, &plen) < 0 || r.pos + plen != store.size) {
-                        g_store_readonly = true;
-                        return;
+                        e = -EBADMSG;
+                        goto fail;
                 }
                 pt = malloc(plen ? plen : 1);
                 if (!pt) {
-                        g_store_readonly = true;
-                        return;
+                        e = -ENOMEM;
+                        goto fail;
                 }
-                if (vault_open(g_vault_key, nonce, store.data + r.pos, plen, tag, pt) < 0) {
-                        sd_journal_print(LOG_ERR, "cannot decrypt store (wrong key or tampered); "
-                                         "writes disabled to protect it");
-                        g_store_readonly = true;
+                if ((e = vault_open(g_vault_key, nonce, store.data + r.pos, plen, tag, pt)) < 0) {
+                        sd_journal_print(LOG_ERR, "Cannot decrypt secret store: %s; writes disabled", strerror(-e));
                         vault_wipe(pt, plen);
-                        return;
+                        goto fail;
                 }
                 e = manager_deserialize_payload(mgr, pt, plen, version);
                 vault_wipe(pt, plen);
         } else {
                 sd_journal_print(LOG_ERR, "unsupported store cipher %u, writes disabled to protect it", cipher);
-                g_store_readonly = true;
-                return;
+                e = -EOPNOTSUPP;
+                goto fail;
         }
 
         if (e < 0) {
                 sd_journal_print(LOG_ERR, "cannot parse secret store %s: %s; writes disabled",
                                  path, strerror(-e));
-                g_store_readonly = true;
-        } else {
-                g_store_encrypted = cipher == 1;
-                if ((version < 3 || (g_encrypting && !g_store_encrypted)) && (e = manager_save()) < 0) {
-                        sd_journal_print(LOG_ERR, "Failed to migrate secret store: %s", strerror(-e));
-                        g_store_readonly = true;
-                }
+                goto fail;
         }
+        g_store_loaded = true;
+        g_store_encrypted = cipher == 1;
+        if ((version < 3 || (g_encrypting && !g_store_encrypted)) && (e = manager_save()) < 0) {
+                sd_journal_print(LOG_ERR, "Failed to migrate secret store: %s", strerror(-e));
+                goto fail;
+        }
+        return;
+
+fail:
+        g_store_readonly = true;
+        g_store_error = -e;
 }
 
 /* --- the default collection (org.freedesktop.Secret.Collection) --- */
@@ -4188,6 +4195,10 @@ static int vl_get_status(sd_varlink *link, sd_json_variant *parameters,
                 SD_JSON_BUILD_PAIR("manualLocked", SD_JSON_BUILD_BOOLEAN(mgr->manual_locked)),
                 SD_JSON_BUILD_PAIR("itemCount", SD_JSON_BUILD_UNSIGNED(count)),
                 SD_JSON_BUILD_PAIR("encrypted", SD_JSON_BUILD_BOOLEAN(g_store_encrypted)),
+                SD_JSON_BUILD_PAIR("storeLoaded", SD_JSON_BUILD_BOOLEAN(g_store_loaded)),
+                SD_JSON_BUILD_PAIR("storeReadOnly", SD_JSON_BUILD_BOOLEAN(g_store_readonly)),
+                SD_JSON_BUILD_PAIR("storeDegraded", SD_JSON_BUILD_BOOLEAN(g_store_readonly || g_store_uncertain || g_store_error != 0)),
+                SD_JSON_BUILD_PAIR("storeError", SD_JSON_BUILD_INTEGER(g_store_error)),
                 SD_JSON_BUILD_PAIR("sessionTracked", SD_JSON_BUILD_STRING(session ? session : "")),
                 SD_JSON_BUILD_PAIR("homeStorage", SD_JSON_BUILD_STRING(mgr->home_storage ? mgr->home_storage : "")));
         if (r < 0)
@@ -4440,10 +4451,10 @@ int main(int argc, char **argv) {
 
         sd_notifyf(0, "READY=1\n"
                       "STATUS=Serving org.freedesktop.secrets (persistent store, %s)",
-                   g_store_readonly ? "read-only: store unreadable" :
+                   g_store_readonly ? "read-only: persistence disabled" :
                    g_store_encrypted ? "encrypted" : "plaintext");
         sd_journal_print(LOG_INFO, "claimed %s, serving (%s store)", SECRETS_NAME,
-                         g_store_encrypted ? "encrypted" : "plaintext");
+                         !g_store_loaded ? "unavailable" : g_store_encrypted ? "encrypted" : "plaintext");
 
         r = sd_event_loop(event);
         manager_clear(&manager);
