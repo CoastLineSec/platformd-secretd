@@ -49,7 +49,7 @@ test('vault', executable(
 ))
 test('storage', executable('test-storage', 'test-storage.c', 'vault.c', 'policy.c',
      dependencies : [libsystemd, libcrypto],
-     link_args : ['-Wl,--wrap=read', '-Wl,--wrap=write', '-Wl,--wrap=fsync', '-Wl,--wrap=rename']))
+     link_args : ['-Wl,--wrap=read', '-Wl,--wrap=__read_chk', '-Wl,--wrap=write', '-Wl,--wrap=fsync', '-Wl,--wrap=rename']))
 security_test = executable('test-security', 'test-security.c', dependencies : libsystemd)
 test('integration', find_program('sh'),
      args : [meson.current_source_dir() / 'test-integration.sh', secretd_isolated],

@@ -1781,6 +1781,17 @@ static int rd_bytes(Rd *r, uint8_t **out, size_t *n) {   /* fresh NUL-terminated
         return 0;
 }
 
+static int rd_string(Rd *r, char **ret) {
+        uint8_t *value;
+        int e;
+
+        e = rd_bytes(r, &value, NULL);
+        if (e < 0)
+                return e;
+        *ret = (char *) value;
+        return 0;
+}
+
 static void mkdir_p(const char *path) {
         _cleanup_free_ char *p = strdup(path);
         if (!p)
@@ -2167,7 +2178,7 @@ static int manager_deserialize_payload(Manager *mgr, const uint8_t *payload, siz
         if (version >= 3) {
                 uint32_t count;
 
-                if ((r = rd_bytes(&p, (uint8_t **) &default_label, NULL)) < 0 ||
+                if ((r = rd_string(&p, &default_label)) < 0 ||
                     (r = rd_u64(&p, &default_created)) < 0 ||
                     (r = rd_u64(&p, &default_modified)) < 0 ||
                     (r = rd_u32(&p, &count)) < 0)
@@ -2179,8 +2190,8 @@ static int manager_deserialize_payload(Manager *mgr, const uint8_t *payload, siz
                 for (uint32_t i = 0; i < count; i++) {
                         _cleanup_free_ char *name = NULL, *collection = NULL;
 
-                        if ((r = rd_bytes(&p, (uint8_t **) &name, NULL)) < 0 ||
-                            (r = rd_bytes(&p, (uint8_t **) &collection, NULL)) < 0)
+                        if ((r = rd_string(&p, &name)) < 0 ||
+                            (r = rd_string(&p, &collection)) < 0)
                                 goto fail;
                         if (!text_valid(name, 256) || !*name || alias_find(&aliases, name) ||
                             !manager_find_collection(mgr, collection)) {
@@ -2208,7 +2219,7 @@ static int manager_deserialize_payload(Manager *mgr, const uint8_t *payload, siz
                         r = -ENOMEM;
                         goto fail;
                 }
-                if ((version >= 3 && (r = rd_bytes(&p, (uint8_t **) &it->path, NULL)) < 0) ||
+                if ((version >= 3 && (r = rd_string(&p, &it->path)) < 0) ||
                     (r = rd_u64(&p, &it->created)) < 0 ||
                     (r = rd_u64(&p, &it->modified)) < 0 ||
                     (r = rd_bytes(&p, &ct, NULL)) < 0 ||

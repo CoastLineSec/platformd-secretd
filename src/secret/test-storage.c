@@ -22,6 +22,18 @@ ssize_t __wrap_read(int fd, void *data, size_t size) {
         return __real_read(fd, data, size);
 }
 
+#ifdef __GLIBC__
+ssize_t __real___read_chk(int fd, void *data, size_t size, size_t capacity);
+
+ssize_t __wrap___read_chk(int fd, void *data, size_t size, size_t capacity) {
+        if (fault == 5) {
+                errno = EIO;
+                return -1;
+        }
+        return __real___read_chk(fd, data, size, capacity);
+}
+#endif
+
 ssize_t __wrap_write(int fd, const void *data, size_t size) {
         if (fault == 1) {
                 errno = EIO;
