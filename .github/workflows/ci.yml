@@ -55,6 +55,7 @@ jobs:
             git base-devel meson ninja gperf python-jinja \
             systemd openssl polkit dbus libsecret \
             libxslt libxml2 docbook-xsl groff shellcheck actionlint
+          systemd-machine-id-setup
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
