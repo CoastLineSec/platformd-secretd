@@ -1,6 +1,37 @@
 platformd-secretd NEWS
 ======================
 
+CHANGES WITH 0.1.5:
+
+        Incompatible changes:
+
+        * Version 2 stores are migrated to version 3 on load. The new format
+          preserves item identifiers, collection labels, and aliases across
+          restarts. Applications should rediscover items by attributes after
+          migration. Earlier releases cannot read the migrated store.
+
+        Secret Service:
+
+        * The reserved session alias now points to a volatile collection. Its
+          contents are never written to disk and are discarded when the last
+          ordinary logind session ends, session tracking is lost, or the service
+          restarts.
+
+        * Locked collections now reject changes. A logind unlock notification
+          clears the desktop lock only after LockedHint is confirmed false.
+          secretctl checks the resulting lock state before reporting success.
+
+        * Changes to protected items now evaluate policy asynchronously and
+          recheck the caller, session, lock state, and store revision before
+          committing.
+
+        Storage:
+
+        * An unusable configured vault key now prevents startup without
+          modifying the store. Store writes synchronize the containing directory
+          before reporting success. The status interface now reports load
+          failures, read-only or degraded state, and the last storage error.
+
 CHANGES WITH 0.1.4:
 
         * Protected item release is now bound to an active, local, unlocked
